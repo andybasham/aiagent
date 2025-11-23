@@ -1,0 +1,2 @@
+cd c:\git\aiagent
+python main.py config/deploy-agencyos-to-prod.json

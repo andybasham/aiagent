@@ -594,6 +594,7 @@ class DatabaseHandler:
                 sql_var = var_def.get('sql_var', '')
                 json_field = var_def.get('json_field', '')
                 from_parent = var_def.get('from_parent', False)
+                default_value = var_def.get('default_value', None)
 
                 # Determine which JSON object to use
                 source_data = parent_data if from_parent and parent_data else json_data
@@ -607,9 +608,22 @@ class DatabaseHandler:
                     # source_data is a dict/object, navigate to the field
                     value = self._get_json_value(source_data, json_field)
 
-                # Check if this is a password field (variable name contains 'PASSWORD')
-                if 'PASSWORD' in sql_var.upper() and value is not None:
+                    # Use default value if JSON field not found and default is specified
+                    if value is None and default_value is not None:
+                        value = default_value
+
+                # Check if this is a password field that should be hashed
+                # Only hash PASSWORD_HASH or PASSWORD, not fields like RESET_PASSWORD
+                sql_var_upper = sql_var.upper()
+                is_password_field = (
+                    ('PASSWORD_HASH' in sql_var_upper or sql_var_upper == '{{PASSWORD}}')
+                    and value is not None
+                )
+                if is_password_field:
                     value = self._hash_password(str(value))
+
+                # Check if value is a SQL function (e.g., NOW(), CURRENT_TIMESTAMP(), UUID())
+                is_sql_function = isinstance(value, str) and value.strip().upper().endswith('()')
 
                 # Convert value to SQL format based on type
                 if value is None:
@@ -623,6 +637,14 @@ class DatabaseHandler:
                     # MySQL JSON column expects valid JSON format
                     json_str = json.dumps(value, ensure_ascii=False)
                     sql_value = json_str.replace("'", "''")
+                elif is_password_field:
+                    # Password hash - use UNHEX to avoid shell escaping issues with $ characters
+                    # Convert the bcrypt hash to hex representation
+                    hex_value = value.encode('utf-8').hex()
+                    sql_value = f"UNHEX('{hex_value}')"
+                elif is_sql_function:
+                    # SQL function - use as-is without quotes
+                    sql_value = str(value).strip()
                 else:
                     # String value - escape single quotes but DON'T wrap in quotes
                     # The SQL template itself should have quotes (e.g., '{{NAME}}')
@@ -636,6 +658,13 @@ class DatabaseHandler:
                     # Template has quotes around variable: '{{VAR}}'
                     if value is None:
                         # For NULL, remove the quotes: '{{VAR}}' -> NULL
+                        result = result.replace(quoted_pattern, sql_value)
+                    elif is_password_field:
+                        # For password hashes using UNHEX, remove the quotes completely
+                        # '{{PASSWORD_HASH}}' -> UNHEX('...')
+                        result = result.replace(quoted_pattern, sql_value)
+                    elif is_sql_function:
+                        # For SQL functions, remove the quotes: '{{VAR}}' -> NOW()
                         result = result.replace(quoted_pattern, sql_value)
                     else:
                         # For other values, keep the quotes: '{{VAR}}' -> 'value'

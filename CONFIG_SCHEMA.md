@@ -369,10 +369,11 @@ Each object in the `variables` array:
 | `sql_var` | string | Yes | SQL variable placeholder (e.g., "{{NAME}}") |
 | `json_field` | string | Yes | JSON field path (supports dot notation). Use `"."` to reference the element itself when working with primitive arrays (strings, numbers). |
 | `from_parent` | boolean | No | Get value from parent object vs array element (default: false) |
+| `default_value` | any | No | Default value to use if JSON field is not found (default: NULL). Can be string, number, boolean, or SQL function like "NOW()". |
 
 **Special Behavior:**
-- Variables containing "PASSWORD" in the name are automatically hashed with bcrypt using PHP's `PASSWORD_DEFAULT` format (`$2y$10$...`), fully compatible with PHP's `password_verify()` function
-- Missing JSON fields are replaced with SQL NULL
+- Variables named `{{PASSWORD_HASH}}` or `{{PASSWORD}}` are automatically hashed with bcrypt using PHP's `PASSWORD_DEFAULT` format (`$2y$10$...`), fully compatible with PHP's `password_verify()` function. Other PASSWORD-related fields (like `{{RESET_PASSWORD}}`) are NOT hashed.
+- Missing JSON fields are replaced with SQL NULL (or the `default_value` if specified)
 - Dot notation supports nested fields (e.g., "terminology.employee")
 - **Primitive Arrays**: When `nested_array_field` contains primitives (e.g., `["Admin", "User"]`), use `"json_field": "."` to reference the element value directly
 - **SQL Template Quoting**: String variables must be wrapped in quotes in the template (e.g., `'{{NAME}}'`). The replacement logic only escapes quotes, it doesn't add them.

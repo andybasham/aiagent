@@ -9,8 +9,9 @@ This document describes all available configuration options for the ai-deploy ag
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `agent_name` | string | Yes | Must be "ai-deploy" |
-| `description` | string | No | Human-readable description of this configuration |
+| `description` | string | No | Human-readable description of this configuration (used in warn prompt) |
 | `application_name` | string | No | Application name for {{APPLICATION_NAME}} template variable replacement in config values and deployed files |
+| `warn` | boolean | No | Enable confirmation prompt before deployment (default: false) |
 | `source` | object | Yes | Source location configuration |
 | `destination` | object | Yes | Destination location configuration |
 | `ignore` | object | No | Patterns for files/folders to ignore |
@@ -314,7 +315,8 @@ The `database` object enables database deployment and seeding functionality via 
 | `admin_username` | string | Yes* | MySQL admin username |
 | `admin_password` | string | Yes* | MySQL admin password |
 | `main_database_scripts` | object | No | Main database deployment config |
-| `tenant_database_scripts` | array | No | Tenant database deployment configs |
+| `tenant-database` | object | No | Tenant database deployment config (per-tenant execution) |
+| `tenant_data_scripts` | object | No | Tenant data scripts (executed once, files use explicit USE statements) |
 | `seed_tables` | object | No | Table seeding configuration |
 
 \* Required when `enabled: true`
@@ -330,56 +332,57 @@ The `database` object enables database deployment and seeding functionality via 
 | `setup_path` | string | No | Path to setup SQL scripts directory |
 | `tables_path` | string | No | Path to table creation scripts |
 | `procedures_path` | string | No | Path to stored procedure scripts |
+| `data_path` | string | No | Path to data SQL scripts (runs after procedures) |
 | `seeds_path` | string | No | Path to seed data scripts |
 
-### Seed Tables Configuration
+### Tenant Database Scripts Object
 
-The `seed_tables` object enables dynamic table seeding from JSON configuration files.
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `enabled` | boolean | Yes | Enable/disable table seeding |
-| `config_files_path` | string | Yes* | Directory containing JSON config files |
-| `config_files_extension` | string | No | File extension to match (default: ".json") |
-| `tables` | array | Yes* | Array of table seeding definitions |
-
-\* Required when `enabled: true`
-
-### Table Seeding Definition
-
-Each object in the `tables` array:
+The `tenant-database` object defines scripts that are executed **for each tenant** using template variable replacement for `{{WEBID}}`.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `table_name` | string | Yes | Name of the database table |
-| `table_script_file` | string | Yes | Path to table SQL file with INSERT template |
-| `begin_mark` | string | Yes | Comment marker for template start |
-| `end_mark` | string | Yes | Comment marker for template end |
-| `check_exists_query` | string | No | SQL query with variable replacement to check if data exists. For non-array tables: checks if specific record exists (e.g., `SELECT COUNT(1) FROM tenant WHERE webid = '{{WEBID}}'`). For array tables: checks if any records exist for this tenant before inserting entire array (e.g., `SELECT COUNT(1) FROM user WHERE tenant_id = (SELECT id FROM tenant WHERE webid = '{{WEBID}}')`). |
-| `array_field` | string | No | JSON field containing array of records (e.g., "users") |
-| `nested_array_field` | string | No | JSON field within each element of `array_field` containing a nested array (e.g., "roles"). When specified, loops through outer array, then inner array, inserting one record per nested element. |
-| `variables` | array | Yes | Variable mapping definitions |
+| `enabled` | boolean | Yes | Enable/disable tenant database deployment |
+| `db_name` | string | Yes | Database name (supports {{WEBID}} template variable) |
+| `db_username` | string | Yes | Database username |
+| `db_password` | string | Yes | Database password |
+| `setup_path` | string | No | Path to setup SQL scripts directory (executed per tenant) |
+| `tables_path` | string | No | Path to table creation scripts (executed per tenant) |
+| `procedures_path` | string | No | Path to stored procedure scripts (executed per tenant) |
+| `seeds_path` | string | No | Path to seed data scripts (executed per tenant) |
 
-### Variable Mapping Definition
+**Note**: Scripts in these paths are executed once **per tenant**. Each tenant's database is created using template variables like `{{WEBID}}`.
 
-Each object in the `variables` array:
+### Tenant Data Scripts Object
+
+The `tenant_data_scripts` object defines scripts that are executed **once** after all tenant databases are created. Each SQL file uses explicit `USE database_name;` statements to target specific databases.
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
-| `sql_var` | string | Yes | SQL variable placeholder (e.g., "{{NAME}}") |
-| `json_field` | string | Yes | JSON field path (supports dot notation). Use `"."` to reference the element itself when working with primitive arrays (strings, numbers). |
-| `from_parent` | boolean | No | Get value from parent object vs array element (default: false) |
-| `default_value` | any | No | Default value to use if JSON field is not found (default: NULL). Can be string, number, boolean, or SQL function like "NOW()". |
+| `enabled` | boolean | Yes | Enable/disable tenant data scripts |
+| `data_path` | string | Yes | Path to tenant data SQL files (executed once, not per-tenant) |
 
-**Special Behavior:**
-- Variables named `{{PASSWORD_HASH}}` or `{{PASSWORD}}` are automatically hashed with bcrypt using PHP's `PASSWORD_DEFAULT` format (`$2y$10$...`), fully compatible with PHP's `password_verify()` function. Other PASSWORD-related fields (like `{{RESET_PASSWORD}}`) are NOT hashed.
-- Missing JSON fields are replaced with SQL NULL (or the `default_value` if specified)
-- Dot notation supports nested fields (e.g., "terminology.employee")
-- **Primitive Arrays**: When `nested_array_field` contains primitives (e.g., `["Admin", "User"]`), use `"json_field": "."` to reference the element value directly
-- **SQL Template Quoting**: String variables must be wrapped in quotes in the template (e.g., `'{{NAME}}'`). The replacement logic only escapes quotes, it doesn't add them.
+**Key Difference from Tenant Database Scripts**:
+- **Tenant Database Scripts** (`tenant-database`): Executed once per tenant (loops through all tenants)
+- **Tenant Data Scripts** (`tenant_data_scripts`): Executed once total (files use `USE` statements to target specific databases)
+
+**Example tenant data file structure**:
+```sql
+-- Insert into main database
+USE agencyos;
+INSERT INTO tenant (name, webid, ...) VALUES ('Demo', 'demo', ...);
+
+-- Insert into specific tenant database
+USE agencyos_demo;
+INSERT INTO website_css (name, is_active, ...) VALUES ('default', 1, ...);
+
+-- Insert into another tenant database
+USE agencyos_livingwater;
+INSERT INTO website_css (name, is_active, ...) VALUES ('default', 1, ...);
+```
 
 ### Database Example
 
+**Example with Main Database Only:**
 ```json
 {
   "database": {
@@ -397,111 +400,66 @@ Each object in the `variables` array:
       "setup_path": "C:\\db\\setup",
       "tables_path": "C:\\db\\tables",
       "procedures_path": "C:\\db\\procedures",
+      "data_path": "C:\\db\\data",
       "seeds_path": "C:\\db\\seeds"
-    },
-    "seed_tables": {
-      "enabled": true,
-      "config_files_path": "C:\\config\\tenants",
-      "config_files_extension": ".json",
-      "tables": [
-        {
-          "table_name": "tenant",
-          "table_script_file": "C:\\db\\tables\\tenant.sql",
-          "begin_mark": "BEGIN AI-AGENT.AI-DEPLOY:",
-          "end_mark": "END AI-AGENT.AI-DEPLOY:",
-          "check_exists_query": "SELECT COUNT(1) FROM tenant WHERE webid = '{{WEBID}}'",
-          "variables": [
-            {"sql_var": "{{NAME}}", "json_field": "name"},
-            {"sql_var": "{{WEBID}}", "json_field": "webid"},
-            {"sql_var": "{{EMAIL}}", "json_field": "email"}
-          ]
-        },
-        {
-          "table_name": "user",
-          "table_script_file": "C:\\db\\tables\\user.sql",
-          "begin_mark": "BEGIN AI-AGENT.AI-DEPLOY:",
-          "end_mark": "END AI-AGENT.AI-DEPLOY:",
-          "check_exists_query": "SELECT COUNT(1) FROM user WHERE tenant_id = (SELECT id FROM tenant WHERE webid = '{{WEBID}}')",
-          "array_field": "users",
-          "variables": [
-            {"sql_var": "{{WEBID}}", "json_field": "webid", "from_parent": true},
-            {"sql_var": "{{USERNAME}}", "json_field": "username"},
-            {"sql_var": "{{PASSWORD_HASH}}", "json_field": "password"},
-            {"sql_var": "{{EMAIL}}", "json_field": "email"}
-          ]
-        },
-        {
-          "table_name": "user_role",
-          "table_script_file": "C:\\db\\tables\\user_role.sql",
-          "begin_mark": "BEGIN AI-AGENT.AI-DEPLOY:",
-          "end_mark": "END AI-AGENT.AI-DEPLOY:",
-          "check_exists_query": "SELECT COUNT(1) FROM user_role ur JOIN user u ON ur.user_id = u.id WHERE u.tenant_id = (SELECT id FROM tenant WHERE webid = '{{WEBID}}')",
-          "array_field": "users",
-          "nested_array_field": "roles",
-          "variables": [
-            {"sql_var": "{{WEBID}}", "json_field": "webid", "from_parent": true},
-            {"sql_var": "{{USERNAME}}", "json_field": "username", "from_parent": true},
-            {"sql_var": "{{ROLE_NAME}}", "json_field": "."}
-          ]
-        }
-      ]
     }
   }
 }
 ```
 
-**How It Works:**
-
-1. All JSON files in `config_files_path` are processed
-2. For each table definition:
-   - Executes `check_exists_query` (if provided) to see if data exists
-   - For non-array tables: If specific record exists, skips that record
-   - For array tables: If any records exist for this tenant, skips entire array
-   - Extracts INSERT template from SQL file between markers
-   - If `nested_array_field` specified: loops through outer `array_field`, then loops through `nested_array_field` in each outer element, inserting one row per nested element
-   - If `array_field` specified (no nested): loops through array, inserting one row per element
-   - If no `array_field`: inserts single row from parent JSON
-   - Variables are replaced with JSON values:
-     - For nested arrays: `from_parent: true` gets value from outer element (user), regular variables get value from nested element (role)
-     - For single arrays: `from_parent: true` gets value from root JSON, regular variables get value from array element
-   - Passwords are automatically hashed using bcrypt with cost factor 10 (`$2y$10$...` format)
-3. Execution order: `setup → tables → procedures → seeds → seed_tables`
-
-**Important Notes:**
-- **Main Database Only**: `seed_tables` applies ONLY to the main database. Tenant databases typically have different schemas and should use regular `seeds_path` scripts.
-- **PHP Compatibility**: Password hashes use the exact format produced by PHP's `password_hash($password, PASSWORD_DEFAULT)`. Hashes can be verified in PHP using `password_verify($password, $hash)`.
-- **Hash Format**: `$2y$10$` prefix + 22-character salt + 31-character hash (60 characters total)
-- **Nested Arrays**: When using `nested_array_field`, your JSON structure should have arrays within arrays. The root JSON provides values for variables with `from_parent: true` at the root level, outer array elements provide values for variables with `from_parent: true` at the nested level, and nested array elements provide values for regular variables.
-
-### Example JSON Structure for Nested Arrays
-
+**Example with Multi-Tenant Databases:**
 ```json
 {
-  "webid": "demo",
-  "name": "Demo Tenant",
-  "users": [
-    {
-      "username": "admin.user",
-      "password": "password123",
-      "email": "admin@example.com",
-      "roles": ["Admin", "User"]
+  "database": {
+    "enabled": true,
+    "ssh_host": "192.168.1.4",
+    "ssh_port": 22,
+    "ssh_username": "deploy",
+    "ssh_password": "sshpassword",
+    "admin_username": "root",
+    "admin_password": "mysqlpassword",
+    "main_database_scripts": {
+      "db_name": "agencyos",
+      "db_username": "agencyos_user",
+      "db_password": "dbpassword",
+      "setup_path": "C:\\git\\agencyos\\database\\main\\setup",
+      "tables_path": "C:\\git\\agencyos\\database\\main\\tables",
+      "procedures_path": "C:\\git\\agencyos\\database\\main\\procedures"
     },
-    {
-      "username": "regular.user",
-      "password": "password456",
-      "email": "user@example.com",
-      "roles": ["User"]
+    "tenant-database": {
+      "enabled": true,
+      "db_name": "agencyos_{{WEBID}}",
+      "db_username": "agencyos_user",
+      "db_password": "dbpassword",
+      "setup_path": "C:\\git\\agencyos\\database\\tenant\\setup",
+      "tables_path": "C:\\git\\agencyos\\database\\tenant\\tables",
+      "procedures_path": "C:\\git\\agencyos\\database\\tenant\\procedures"
+    },
+    "tenant_data_scripts": {
+      "enabled": true,
+      "data_path": "C:\\git\\agencyos\\database\\tenant\\data"
     }
-  ]
+  }
 }
 ```
 
-**For the `user_role` table above:**
-- Processes 2 users (outer array)
-- admin.user has 2 roles → inserts 2 user_role records
-- regular.user has 1 role → inserts 1 user_role record
-- Total: 3 user_role records inserted
-- Variables: `{{WEBID}}` from root, `{{USERNAME}}` from user, `{{ROLE_NAME}}` from role element (using `"json_field": "."` for primitive array)
+**Script Execution Order:**
+
+1. **Main Database Scripts** (if configured):
+   - `setup_path` - Database setup scripts (create database, users, grants)
+   - `tables_path` - Table creation scripts
+   - `procedures_path` - Stored procedure scripts
+   - `data_path` - Data scripts (runs after procedures)
+   - `seeds_path` - Seed data scripts
+
+2. **Tenant Database Scripts** (if configured, executed per tenant):
+   - `setup_path` - Database setup scripts (create tenant database, users, grants)
+   - `tables_path` - Table creation scripts
+   - `procedures_path` - Stored procedure scripts
+   - `seeds_path` - Seed data scripts
+
+3. **Tenant Data Scripts** (if configured, executed once after all tenant databases are created):
+   - `data_path` - SQL files using explicit `USE` statements to insert data into specific databases
 
 ## Complete Example Configurations
 

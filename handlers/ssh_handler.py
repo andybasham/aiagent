@@ -1,9 +1,11 @@
 """Handler for SSH/SFTP connections."""
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Dict, List, Optional
 import paramiko
 from stat import S_ISDIR
+
+from utils.ssh_utils import load_ssh_private_key
 
 
 class SSHHandler:
@@ -51,33 +53,7 @@ class SSHHandler:
             # Determine authentication method
             if self.key_file:
                 # Use key-based authentication
-                # Pass passphrase if provided (can be None or empty string for unencrypted keys)
-                passphrase = self.passphrase if self.passphrase else None
-
-                # Try to load the key with different key types
-                private_key = None
-                key_types = [
-                    ('Ed25519', paramiko.Ed25519Key),
-                    ('RSA', paramiko.RSAKey),
-                    ('ECDSA', paramiko.ECDSAKey),
-                    ('DSS', paramiko.DSSKey)
-                ]
-
-                last_error = None
-                for key_name, key_class in key_types:
-                    try:
-                        private_key = key_class.from_private_key_file(
-                            self.key_file,
-                            password=passphrase
-                        )
-                        break
-                    except Exception as e:
-                        last_error = e
-                        continue
-
-                if private_key is None:
-                    raise ValueError(f"Failed to load private key from {self.key_file}. Last error: {last_error}")
-
+                private_key = load_ssh_private_key(self.key_file, self.passphrase)
                 self.ssh_client.connect(
                     hostname=self.host,
                     port=self.port,
@@ -109,6 +85,34 @@ class SSHHandler:
         if self.ssh_client:
             self.ssh_client.close()
         self._connected = False
+
+    def _validate_relative_path(self, relative_path: str) -> str:
+        """
+        Validate and normalize relative path to prevent traversal attacks.
+
+        Args:
+            relative_path: The relative path to validate
+
+        Returns:
+            Normalized path with forward slashes
+
+        Raises:
+            ValueError: If path contains traversal attempts
+        """
+        # Normalize the path
+        normalized = os.path.normpath(relative_path)
+
+        # Check for path traversal attempts
+        if normalized.startswith('..') or os.path.isabs(normalized):
+            raise ValueError(f"Invalid path: {relative_path} - path traversal not allowed")
+
+        # Ensure no path component is '..'
+        parts = Path(normalized).parts
+        if '..' in parts:
+            raise ValueError(f"Invalid path contains parent reference: {relative_path}")
+
+        # Return with forward slashes for remote paths
+        return normalized.replace('\\', '/')
 
     def list_files(self, recursive: bool = True) -> List[Dict[str, any]]:
         """
@@ -163,7 +167,9 @@ class SSHHandler:
         if not self.sftp_client:
             raise RuntimeError("Not connected to SSH server")
 
-        full_path = os.path.join(self.path, relative_path).replace('\\', '/')
+        # Validate path to prevent traversal attacks
+        validated_path = self._validate_relative_path(relative_path)
+        full_path = os.path.join(self.path, validated_path).replace('\\', '/')
         with self.sftp_client.open(full_path, 'rb') as f:
             return f.read()
 
@@ -172,7 +178,9 @@ class SSHHandler:
         if not self.sftp_client:
             raise RuntimeError("Not connected to SSH server")
 
-        full_path = os.path.join(self.path, relative_path).replace('\\', '/')
+        # Validate path to prevent traversal attacks
+        validated_path = self._validate_relative_path(relative_path)
+        full_path = os.path.join(self.path, validated_path).replace('\\', '/')
 
         # Create parent directories if needed
         parent_dir = full_path.rsplit('/', 1)[0] if '/' in full_path else ''
@@ -187,7 +195,9 @@ class SSHHandler:
         if not self.sftp_client:
             raise RuntimeError("Not connected to SSH server")
 
-        full_path = os.path.join(self.path, relative_path).replace('\\', '/')
+        # Validate path to prevent traversal attacks
+        validated_path = self._validate_relative_path(relative_path)
+        full_path = os.path.join(self.path, validated_path).replace('\\', '/')
         self.sftp_client.remove(full_path)
 
     def delete_directory(self, relative_path: str) -> None:
@@ -195,7 +205,9 @@ class SSHHandler:
         if not self.sftp_client:
             raise RuntimeError("Not connected to SSH server")
 
-        full_path = os.path.join(self.path, relative_path).replace('\\', '/')
+        # Validate path to prevent traversal attacks
+        validated_path = self._validate_relative_path(relative_path)
+        full_path = os.path.join(self.path, validated_path).replace('\\', '/')
         self._remove_remote_directory(full_path)
 
     def _remove_remote_directory(self, path: str) -> None:
@@ -210,23 +222,53 @@ class SSHHandler:
 
     def create_directory(self, relative_path: str) -> None:
         """Create a directory on the remote server."""
-        full_path = os.path.join(self.path, relative_path).replace('\\', '/')
+        # Validate path to prevent traversal attacks
+        validated_path = self._validate_relative_path(relative_path)
+        full_path = os.path.join(self.path, validated_path).replace('\\', '/')
         self._create_remote_directory(full_path)
 
     def _create_remote_directory(self, path: str) -> None:
-        """Create directory and parent directories if needed."""
+        """
+        Create directory and parent directories if needed.
+        Thread-safe: Handles race conditions when multiple threads try to create the same directory.
+
+        Args:
+            path: Remote path to create
+
+        Raises:
+            RuntimeError: If not connected to SSH server
+        """
         if not self.sftp_client:
-            return
+            raise RuntimeError("Not connected to SSH server - cannot create directory")
 
         # Ensure path uses forward slashes
         path = path.replace('\\', '/')
 
         try:
             self.sftp_client.stat(path)
+            # Directory exists, nothing to do
+            return
         except FileNotFoundError:
             # Directory doesn't exist, create it
-            # Use forward slash for parent path on Unix systems
-            parent = path.rsplit('/', 1)[0] if '/' in path else ''
-            if parent and parent != '/':
-                self._create_remote_directory(parent)
+            pass
+
+        # Create parent directory first (recursive)
+        parent = path.rsplit('/', 1)[0] if '/' in path else ''
+        if parent and parent != '/':
+            self._create_remote_directory(parent)
+
+        # Try to create the directory
+        try:
             self.sftp_client.mkdir(path)
+        except OSError as e:
+            # Check if directory now exists (race condition - another thread created it)
+            try:
+                stat_result = self.sftp_client.stat(path)
+                import stat as stat_module
+                if stat_module.S_ISDIR(stat_result.st_mode):
+                    # Directory exists and is a directory, not a file - this is fine
+                    return
+            except:
+                pass
+            # Re-raise the original error if it wasn't a race condition
+            raise e

@@ -3,12 +3,16 @@ import os
 import logging
 import json
 import re
-from typing import Optional, List, Dict, Any
+import uuid
+from typing import Optional, List, Dict, Any, Tuple
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 import paramiko
 import mysql.connector
-from mysql.connector import Error
 import bcrypt
+
+from utils.ssh_utils import load_ssh_private_key
 
 
 class DatabaseHandler:
@@ -84,33 +88,8 @@ class DatabaseHandler:
             self.logger.debug(f"Connecting to SSH server {self.ssh_host}:{self.ssh_port}...")
 
             if self.ssh_key_file:
-                # Pass passphrase if provided (can be None or empty string for unencrypted keys)
-                passphrase = self.ssh_passphrase if self.ssh_passphrase else None
-
-                # Try to load the key with different key types
-                key = None
-                key_types = [
-                    ('Ed25519', paramiko.Ed25519Key),
-                    ('RSA', paramiko.RSAKey),
-                    ('ECDSA', paramiko.ECDSAKey),
-                    ('DSS', paramiko.DSSKey)
-                ]
-
-                last_error = None
-                for key_name, key_class in key_types:
-                    try:
-                        key = key_class.from_private_key_file(
-                            self.ssh_key_file,
-                            password=passphrase
-                        )
-                        break
-                    except Exception as e:
-                        last_error = e
-                        continue
-
-                if key is None:
-                    raise ValueError(f"Failed to load private key from {self.ssh_key_file}. Last error: {last_error}")
-
+                # Use key-based authentication
+                key = load_ssh_private_key(self.ssh_key_file, self.ssh_passphrase)
                 self.ssh_client.connect(
                     hostname=self.ssh_host,
                     port=self.ssh_port,
@@ -252,7 +231,8 @@ class DatabaseHandler:
             # Convert Windows line endings (CRLF) to Unix (LF)
             sql_content_unix = sql_content.replace('\r\n', '\n').replace('\r', '\n')
 
-            temp_sql_path = f"/tmp/deploy_sql_{file_name}"
+            # Use UUID for temp file to prevent collisions in parallel execution
+            temp_sql_path = f"/tmp/deploy_sql_{uuid.uuid4().hex}_{file_name}"
             sftp = self.ssh_client.open_sftp()
             try:
                 with sftp.file(temp_sql_path, 'w') as remote_file:
@@ -314,7 +294,7 @@ class DatabaseHandler:
         # Sort alphabetically (full paths ensure consistent ordering)
         return sorted(sql_files)
 
-    def execute_sql_directory(self, directory_path: str, dry_run: bool = False, use_database: bool = True, template_vars: dict = None, database_name: str = None, last_deployment_timestamp: float = None) -> tuple[bool, int]:
+    def execute_sql_directory(self, directory_path: str, dry_run: bool = False, use_database: bool = True, template_vars: dict = None, database_name: str = None, last_deployment_timestamp: float = None, file_pattern_filter: str = None) -> tuple[bool, int]:
         """
         Execute all SQL files in a directory and subdirectories (sorted alphabetically).
         Optionally skip files that haven't been modified since last deployment.
@@ -326,6 +306,7 @@ class DatabaseHandler:
             template_vars: Dictionary of template variables to replace in SQL
             database_name: Name of database to use (optional)
             last_deployment_timestamp: Unix timestamp of last deployment, skip files older than this
+            file_pattern_filter: Optional filename pattern to filter files (e.g., "*livingwater*")
 
         Returns:
             Tuple of (success: bool, files_executed_count: int)
@@ -345,6 +326,20 @@ class DatabaseHandler:
             if not sql_files:
                 self.logger.warning(f"No SQL files found in: {directory_path}")
                 return (True, 0)
+
+            # Filter files by pattern if provided
+            if file_pattern_filter:
+                import fnmatch
+                filtered_files = []
+                for file_path in sql_files:
+                    filename = os.path.basename(file_path)
+                    if fnmatch.fnmatch(filename.lower(), file_pattern_filter.lower()):
+                        filtered_files.append(file_path)
+                sql_files = filtered_files
+
+                if not sql_files:
+                    self.logger.warning(f"No SQL files matched pattern '{file_pattern_filter}' in: {directory_path}")
+                    return (True, 0)
 
             # Filter files by modification time if timestamp provided
             files_to_execute = []
@@ -410,6 +405,42 @@ class DatabaseHandler:
             self.logger.error(f"Error checking if database exists: {e}")
             return False
 
+    def wait_for_database(self, database_name: str, max_attempts: int = 5, delay: float = 0.5) -> bool:
+        """
+        Wait for a database to become available after creation.
+        Useful in parallel deployment scenarios where database may take time to be fully ready.
+
+        Args:
+            database_name: Name of the database to wait for
+            max_attempts: Maximum number of attempts (default: 5)
+            delay: Delay between attempts in seconds (default: 0.5)
+
+        Returns:
+            True if database becomes available, False otherwise
+        """
+        import time
+
+        for attempt in range(max_attempts):
+            if self.database_exists(database_name):
+                # Database exists, now verify we can USE it
+                try:
+                    use_cmd = f"mysql -h {self.db_host} -P {self.db_port} -u {self.db_username} -p{self.db_password} -e \"USE {database_name}; SELECT 1;\""
+                    stdin, stdout, stderr = self.ssh_client.exec_command(use_cmd)
+                    exit_status = stdout.channel.recv_exit_status()
+
+                    if exit_status == 0:
+                        self.logger.debug(f"Database '{database_name}' is available")
+                        return True
+                except Exception:
+                    pass
+
+            if attempt < max_attempts - 1:
+                self.logger.debug(f"Waiting for database '{database_name}' to be available (attempt {attempt + 1}/{max_attempts})...")
+                time.sleep(delay)
+
+        self.logger.error(f"Database '{database_name}' did not become available after {max_attempts} attempts")
+        return False
+
     def execute_sql_command(self, sql_command: str, dry_run: bool = False, database_name: str = None) -> bool:
         """
         Execute a SQL command directly on the database.
@@ -433,8 +464,7 @@ class DatabaseHandler:
             # Convert Windows line endings (CRLF) to Unix (LF)
             sql_content_unix = sql_command.replace('\r\n', '\n').replace('\r', '\n')
 
-            import hashlib
-            temp_sql_path = f"/tmp/deploy_sql_{hashlib.md5(sql_command.encode()).hexdigest()}.sql"
+            temp_sql_path = f"/tmp/deploy_sql_{uuid.uuid4().hex}.sql"
             sftp = self.ssh_client.open_sftp()
             try:
                 with sftp.file(temp_sql_path, 'w') as remote_file:
@@ -543,7 +573,14 @@ class DatabaseHandler:
         Returns:
             Bcrypt hashed password string in PHP PASSWORD_DEFAULT format
             Example: $2y$10$xnDBJl/1Q9v4qs42b67pZOTgBFkr6iHJCkDCHdtDARKJrVRq.p2dW
+
+        Raises:
+            ValueError: If password is empty
+            RuntimeError: If password hashing fails
         """
+        if not plain_password:
+            raise ValueError("Password cannot be empty")
+
         try:
             # Generate salt with cost factor 10 (matching PHP's PASSWORD_DEFAULT)
             salt = bcrypt.gensalt(rounds=10)
@@ -559,8 +596,8 @@ class DatabaseHandler:
             return hash_str
 
         except Exception as e:
-            self.logger.error(f"Error hashing password: {e}")
-            return plain_password  # Return original if hashing fails
+            self.logger.error(f"Fatal error hashing password: {e}")
+            raise RuntimeError(f"Failed to hash password securely: {e}") from e
 
     def _replace_seed_variables(
         self,
@@ -733,8 +770,7 @@ class DatabaseHandler:
             self.logger.debug(f"  Executing check query: {query_to_execute}")
 
             # Upload SQL to temp file to avoid shell variable expansion issues
-            import hashlib
-            temp_sql_path = f"/tmp/check_query_{hashlib.md5(query_to_execute.encode()).hexdigest()}.sql"
+            temp_sql_path = f"/tmp/check_query_{uuid.uuid4().hex}.sql"
 
             # Convert to Unix line endings
             sql_content_unix = query_to_execute.replace('\r\n', '\n')
@@ -779,12 +815,154 @@ class DatabaseHandler:
             self.logger.error(f"Error checking table data: {e}")
             return False
 
+    def _deploy_single_tenant(
+        self,
+        tenant_config: Dict[str, Any],
+        admin_username: str,
+        admin_password: str,
+        main_database_scripts: Optional[Dict] = None,
+        dry_run: bool = False,
+        last_deployment_timestamp: float = None,
+        application_name: str = None
+    ) -> Tuple[bool, bool, str]:
+        """
+        Deploy a single tenant database. This method can be run in parallel with other
+        tenant deployments. Uses the shared SSH connection with thread-safe locking.
+
+        Args:
+            tenant_config: Tenant database configuration
+            admin_username: Admin username
+            admin_password: Admin password
+            main_database_scripts: Main database configuration (for template variables)
+            dry_run: If True, only show what would be executed
+            last_deployment_timestamp: Unix timestamp of last deployment
+            application_name: Application name for template variables
+
+        Returns:
+            Tuple of (success: bool, any_scripts_executed: bool, tenant_name: str)
+        """
+        tenant_name = tenant_config.get('db_name')
+        success = True
+        any_scripts_executed = False
+
+        try:
+
+            self.logger.warning("=" * 60)
+            self.logger.warning(f"DEPLOYING TENANT: {tenant_name}")
+            self.logger.warning("=" * 60)
+
+            # Extract tenant webid from database name
+            tenant_webid = None
+            if application_name and tenant_name:
+                prefix = f"{application_name}_"
+                if tenant_name.startswith(prefix):
+                    tenant_webid = tenant_name[len(prefix):]
+                else:
+                    tenant_webid = tenant_name
+
+            # Build template variables for this tenant
+            tenant_template_vars = {
+                'ADMIN_USERNAME': admin_username,
+                'ADMIN_PASSWORD': admin_password,
+                'MAIN_DB_NAME': main_database_scripts.get('db_name') if main_database_scripts else None,
+                'MAIN_DB_USERNAME': main_database_scripts.get('db_username') if main_database_scripts else None,
+                'MAIN_DB_PASSWORD': main_database_scripts.get('db_password') if main_database_scripts else None,
+                'TENANT_DB_NAME': tenant_config.get('db_name'),
+                'TENANT_DB_USERNAME': tenant_config.get('db_username'),
+                'TENANT_DB_PASSWORD': tenant_config.get('db_password'),
+                'TENANT_WEBID': tenant_webid
+            }
+            if application_name:
+                tenant_template_vars['APPLICATION_NAME'] = application_name
+
+            # Check if tenant database exists
+            tenant_db_exists = self.database_exists(tenant_name) if not dry_run else True
+
+            # Force setup scripts to run if database doesn't exist
+            tenant_setup_timestamp = last_deployment_timestamp if tenant_db_exists else None
+            if not tenant_db_exists and not dry_run:
+                self.logger.info(f"Database '{tenant_name}' does not exist, forcing setup scripts to run")
+
+            # 1. Execute tenant setup scripts
+            if tenant_config.get('setup_path'):
+                self.logger.info("=" * 60)
+                self.logger.warning(f"STEP 1: Running setup scripts for tenant '{tenant_name}'")
+                self.logger.info("=" * 60)
+                dir_success, files_executed = self.execute_sql_directory(
+                    tenant_config['setup_path'], dry_run, use_database=False,
+                    template_vars=tenant_template_vars, last_deployment_timestamp=tenant_setup_timestamp
+                )
+                if not dir_success:
+                    success = False
+                if files_executed > 0:
+                    any_scripts_executed = True
+
+                    # Wait for database to be fully available after creation
+                    # This is important in parallel deployment to avoid "Unknown database" errors
+                    if not dry_run and not tenant_db_exists:
+                        self.logger.debug(f"Waiting for database '{tenant_name}' to become available...")
+                        if not self.wait_for_database(tenant_name):
+                            self.logger.error(f"Database '{tenant_name}' is not available - subsequent steps may fail")
+                            success = False
+
+            # 2. Execute tenant table scripts
+            if tenant_config.get('tables_path'):
+                self.logger.info("=" * 60)
+                self.logger.warning(f"STEP 2: Creating tables for tenant '{tenant_name}'")
+                self.logger.info("=" * 60)
+                dir_success, files_executed = self.execute_sql_directory(
+                    tenant_config['tables_path'], dry_run, use_database=True,
+                    template_vars=tenant_template_vars, database_name=tenant_name,
+                    last_deployment_timestamp=last_deployment_timestamp
+                )
+                if not dir_success:
+                    success = False
+                if files_executed > 0:
+                    any_scripts_executed = True
+
+            # 3. Execute tenant procedure scripts
+            if tenant_config.get('procedures_path'):
+                self.logger.info("=" * 60)
+                self.logger.warning(f"STEP 3: Creating procedures for tenant '{tenant_name}'")
+                self.logger.info("=" * 60)
+                dir_success, files_executed = self.execute_sql_directory(
+                    tenant_config['procedures_path'], dry_run, use_database=True,
+                    template_vars=tenant_template_vars, database_name=tenant_name,
+                    last_deployment_timestamp=last_deployment_timestamp
+                )
+                if not dir_success:
+                    success = False
+                if files_executed > 0:
+                    any_scripts_executed = True
+
+            # 4. Execute tenant seed scripts
+            if tenant_config.get('seeds_path'):
+                self.logger.info("=" * 60)
+                self.logger.warning(f"STEP 4: Seeding data for tenant '{tenant_name}'")
+                self.logger.info("=" * 60)
+                dir_success, files_executed = self.execute_sql_directory(
+                    tenant_config['seeds_path'], dry_run, use_database=True,
+                    template_vars=tenant_template_vars, database_name=tenant_name,
+                    last_deployment_timestamp=last_deployment_timestamp
+                )
+                if not dir_success:
+                    success = False
+                if files_executed > 0:
+                    any_scripts_executed = True
+
+            return (success, any_scripts_executed, tenant_name)
+
+        except Exception as e:
+            self.logger.error(f"Error deploying tenant '{tenant_name}': {e}")
+            return (False, False, tenant_name)
+
     def deploy_database(
         self,
         admin_username: str,
         admin_password: str,
         main_database_scripts: Optional[dict] = None,
         tenant_database_scripts: Optional[List[dict]] = None,
+        tenant_data_scripts: Optional[dict] = None,
         dry_run: bool = False,
         last_deployment_timestamp: float = None,
         application_name: str = None
@@ -798,6 +976,7 @@ class DatabaseHandler:
             admin_password: Admin password for template variables
             main_database_scripts: Dictionary with db_name, db_username, db_password, setup_path, tables_path, procedures_path, seeds_path
             tenant_database_scripts: List of dictionaries, each with db_name, db_username, db_password, setup_path, tables_path, procedures_path, seeds_path
+            tenant_data_scripts: Dictionary with enabled, data_path - executed ONCE for all tenants (files use explicit USE statements)
             dry_run: If True, only show what would be executed
             last_deployment_timestamp: Unix timestamp of last deployment, skip SQL files older than this
             application_name: Application name for {{APPLICATION_NAME}} template variable replacement
@@ -874,10 +1053,21 @@ class DatabaseHandler:
                     if files_executed > 0:
                         any_scripts_executed = True
 
-                # 4. Execute main seed scripts
+                # 4. Execute main data scripts
+                if main_database_scripts.get('data_path'):
+                    self.logger.info("=" * 60)
+                    self.logger.warning("STEP 4: Loading main database data")
+                    self.logger.info("=" * 60)
+                    dir_success, files_executed = self.execute_sql_directory(main_database_scripts['data_path'], dry_run, template_vars=main_template_vars, last_deployment_timestamp=last_deployment_timestamp)
+                    if not dir_success:
+                        success = False
+                    if files_executed > 0:
+                        any_scripts_executed = True
+
+                # 5. Execute main seed scripts
                 if main_database_scripts.get('seeds_path'):
                     self.logger.info("=" * 60)
-                    self.logger.warning("STEP 4: Seeding main database data")
+                    self.logger.warning("STEP 5: Seeding main database data")
                     self.logger.info("=" * 60)
                     dir_success, files_executed = self.execute_sql_directory(main_database_scripts['seeds_path'], dry_run, template_vars=main_template_vars, last_deployment_timestamp=last_deployment_timestamp)
                     if not dir_success:
@@ -885,104 +1075,95 @@ class DatabaseHandler:
                     if files_executed > 0:
                         any_scripts_executed = True
 
-            # TENANT DATABASE DEPLOYMENT
+            # TENANT DATABASE DEPLOYMENT (PARALLEL)
             if tenant_database_scripts:
                 self.logger.warning("=" * 60)
-                self.logger.warning("TENANT DATABASE DEPLOYMENT")
+                self.logger.warning("TENANT DATABASE DEPLOYMENT (PARALLEL)")
+                self.logger.warning("=" * 60)
+                self.logger.info(f"Deploying {len(tenant_database_scripts)} tenant databases in parallel...")
+
+                # Deploy all tenants in parallel
+                # Paramiko's exec_command creates new channels per call, which is thread-safe
+                max_workers = min(len(tenant_database_scripts), 4)  # Cap at 4 concurrent tenant deployments
+                self.logger.info(f"Using {max_workers} parallel workers for tenant deployment")
+
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    # Submit all tenant deployment tasks
+                    futures = {
+                        executor.submit(
+                            self._deploy_single_tenant,
+                            tenant_config,
+                            admin_username,
+                            admin_password,
+                            main_database_scripts,
+                            dry_run,
+                            last_deployment_timestamp,
+                            application_name
+                        ): tenant_config.get('db_name')
+                        for tenant_config in tenant_database_scripts
+                    }
+
+                    # Wait for all tenants to complete
+                    completed = 0
+                    for future in as_completed(futures):
+                        tenant_name = futures[future]
+                        try:
+                            tenant_success, tenant_any_scripts, _ = future.result()
+                            completed += 1
+                            if tenant_success:
+                                self.logger.info(f"[{completed}/{len(tenant_database_scripts)}] ✓ Completed deployment for tenant: {tenant_name}")
+                            else:
+                                self.logger.error(f"[{completed}/{len(tenant_database_scripts)}] ✗ Failed deployment for tenant: {tenant_name}")
+                                success = False
+                            if tenant_any_scripts:
+                                any_scripts_executed = True
+                        except Exception as e:
+                            completed += 1
+                            self.logger.error(f"[{completed}/{len(tenant_database_scripts)}] ✗ Exception deploying tenant {tenant_name}: {e}")
+                            success = False
+
+                self.logger.warning("=" * 60)
+                self.logger.warning(f"All {len(tenant_database_scripts)} tenant deployments completed")
                 self.logger.warning("=" * 60)
 
-                for tenant_config in tenant_database_scripts:
-                    tenant_name = tenant_config.get('db_name')
-                    self.logger.warning("=" * 60)
-                    self.logger.warning(f"DEPLOYING TENANT: {tenant_name}")
-                    self.logger.warning("=" * 60)
+            # TENANT DATA SCRIPTS (Executed once after all tenants are created)
+            if tenant_data_scripts and tenant_data_scripts.get('enabled') and tenant_data_scripts.get('data_path'):
+                self.logger.warning("=" * 60)
+                self.logger.warning("TENANT DATA SCRIPTS")
+                self.logger.warning("=" * 60)
+                self.logger.info("Executing tenant data scripts (each file uses explicit USE statements)...")
 
-                    # Extract tenant webid from database name (e.g., "agencyos_livingwater" -> "livingwater")
-                    tenant_webid = None
-                    if application_name and tenant_name:
-                        # Remove application_name prefix and underscore
-                        prefix = f"{application_name}_"
-                        if tenant_name.startswith(prefix):
-                            tenant_webid = tenant_name[len(prefix):]
-                        else:
-                            # Fallback: use entire database name if pattern doesn't match
-                            tenant_webid = tenant_name
+                # Build template variables
+                template_vars = {
+                    'ADMIN_USERNAME': admin_username,
+                    'ADMIN_PASSWORD': admin_password
+                }
+                if main_database_scripts:
+                    template_vars.update({
+                        'MAIN_DB_NAME': main_database_scripts.get('db_name'),
+                        'MAIN_DB_USERNAME': main_database_scripts.get('db_username'),
+                        'MAIN_DB_PASSWORD': main_database_scripts.get('db_password')
+                    })
+                if application_name:
+                    template_vars['APPLICATION_NAME'] = application_name
 
-                    # Build template variables for this tenant
-                    tenant_template_vars = {
-                        'ADMIN_USERNAME': admin_username,
-                        'ADMIN_PASSWORD': admin_password,
-                        'MAIN_DB_NAME': main_database_scripts.get('db_name') if main_database_scripts else None,
-                        'MAIN_DB_USERNAME': main_database_scripts.get('db_username') if main_database_scripts else None,
-                        'MAIN_DB_PASSWORD': main_database_scripts.get('db_password') if main_database_scripts else None,
-                        'TENANT_DB_NAME': tenant_config.get('db_name'),
-                        'TENANT_DB_USERNAME': tenant_config.get('db_username'),
-                        'TENANT_DB_PASSWORD': tenant_config.get('db_password'),
-                        'TENANT_WEBID': tenant_webid
-                    }
-                    # Add APPLICATION_NAME if provided
-                    if application_name:
-                        tenant_template_vars['APPLICATION_NAME'] = application_name
+                # Execute all data files in the directory (each file uses USE statements)
+                dir_success, files_executed = self.execute_sql_directory(
+                    tenant_data_scripts['data_path'],
+                    dry_run,
+                    use_database=False,  # Don't specify database - files use USE statements
+                    template_vars=template_vars,
+                    last_deployment_timestamp=last_deployment_timestamp
+                )
 
-                    # Check if tenant database exists
-                    tenant_db_exists = self.database_exists(tenant_name) if not dry_run else True
+                if not dir_success:
+                    success = False
+                if files_executed > 0:
+                    any_scripts_executed = True
 
-                    # Force setup scripts to run if database doesn't exist
-                    tenant_setup_timestamp = last_deployment_timestamp if tenant_db_exists else None
-                    if not tenant_db_exists and not dry_run:
-                        self.logger.info(f"Database '{tenant_name}' does not exist, forcing setup scripts to run")
-
-                    # 1. Execute tenant setup scripts (creates database if needed)
-                    if tenant_config.get('setup_path'):
-                        self.logger.info("=" * 60)
-                        self.logger.warning(f"STEP 1: Running setup scripts for tenant '{tenant_name}'")
-                        self.logger.info("=" * 60)
-                        dir_success, files_executed = self.execute_sql_directory(tenant_config['setup_path'], dry_run, use_database=False, template_vars=tenant_template_vars, last_deployment_timestamp=tenant_setup_timestamp)
-                        if not dir_success:
-                            success = False
-                        if files_executed > 0:
-                            any_scripts_executed = True
-
-                    # 2. Switch to tenant database
-                    self.logger.info("=" * 60)
-                    self.logger.warning(f"STEP 2: Switching to tenant database '{tenant_name}'")
-                    self.logger.info("=" * 60)
-                    if not self.execute_sql_command(f"USE {tenant_name}", dry_run):
-                        success = False
-                        continue  # Skip to next tenant if we can't switch databases
-
-                    # 3. Execute tenant table scripts
-                    if tenant_config.get('tables_path'):
-                        self.logger.info("=" * 60)
-                        self.logger.warning(f"STEP 3: Creating tables for tenant '{tenant_name}'")
-                        self.logger.info("=" * 60)
-                        dir_success, files_executed = self.execute_sql_directory(tenant_config['tables_path'], dry_run, use_database=True, template_vars=tenant_template_vars, database_name=tenant_name, last_deployment_timestamp=last_deployment_timestamp)
-                        if not dir_success:
-                            success = False
-                        if files_executed > 0:
-                            any_scripts_executed = True
-
-                    # 4. Execute tenant procedure scripts
-                    if tenant_config.get('procedures_path'):
-                        self.logger.info("=" * 60)
-                        self.logger.warning(f"STEP 4: Creating procedures for tenant '{tenant_name}'")
-                        self.logger.info("=" * 60)
-                        dir_success, files_executed = self.execute_sql_directory(tenant_config['procedures_path'], dry_run, use_database=True, template_vars=tenant_template_vars, database_name=tenant_name, last_deployment_timestamp=last_deployment_timestamp)
-                        if not dir_success:
-                            success = False
-                        if files_executed > 0:
-                            any_scripts_executed = True
-
-                    # 5. Execute tenant seed scripts
-                    if tenant_config.get('seeds_path'):
-                        self.logger.info("=" * 60)
-                        self.logger.warning(f"STEP 5: Seeding data for tenant '{tenant_name}'")
-                        self.logger.info("=" * 60)
-                        dir_success, files_executed = self.execute_sql_directory(tenant_config['seeds_path'], dry_run, use_database=True, template_vars=tenant_template_vars, database_name=tenant_name, last_deployment_timestamp=last_deployment_timestamp)
-                        if not dir_success:
-                            success = False
-                        if files_executed > 0:
-                            any_scripts_executed = True
+                self.logger.warning("=" * 60)
+                self.logger.warning("Tenant data scripts completed!")
+                self.logger.warning("=" * 60)
 
             return (success, any_scripts_executed)
 

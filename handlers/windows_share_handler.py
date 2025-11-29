@@ -1,6 +1,6 @@
 """Handler for Windows network shares."""
 import os
-from pathlib import Path, PureWindowsPath
+from pathlib import Path
 from typing import Dict, List, Optional
 import shutil
 
@@ -42,6 +42,33 @@ class WindowsShareHandler:
     def disconnect(self) -> None:
         """Disconnect from the Windows share."""
         self._connected = False
+
+    def _validate_relative_path(self, relative_path: str) -> str:
+        """
+        Validate and normalize relative path to prevent traversal attacks.
+
+        Args:
+            relative_path: The relative path to validate
+
+        Returns:
+            Normalized path
+
+        Raises:
+            ValueError: If path contains traversal attempts
+        """
+        # Normalize the path
+        normalized = os.path.normpath(relative_path)
+
+        # Check for path traversal attempts
+        if normalized.startswith('..') or os.path.isabs(normalized):
+            raise ValueError(f"Invalid path: {relative_path} - path traversal not allowed")
+
+        # Ensure no path component is '..'
+        parts = Path(normalized).parts
+        if '..' in parts:
+            raise ValueError(f"Invalid path contains parent reference: {relative_path}")
+
+        return normalized
 
     def list_files(self, recursive: bool = True) -> List[Dict[str, any]]:
         """
@@ -85,30 +112,40 @@ class WindowsShareHandler:
 
     def read_file(self, relative_path: str) -> bytes:
         """Read a file from the share."""
-        full_path = Path(self.path) / relative_path
+        # Validate path to prevent traversal attacks
+        validated_path = self._validate_relative_path(relative_path)
+        full_path = Path(self.path) / validated_path
         with open(full_path, 'rb') as f:
             return f.read()
 
     def write_file(self, relative_path: str, content: bytes) -> None:
         """Write a file to the share."""
-        full_path = Path(self.path) / relative_path
+        # Validate path to prevent traversal attacks
+        validated_path = self._validate_relative_path(relative_path)
+        full_path = Path(self.path) / validated_path
         full_path.parent.mkdir(parents=True, exist_ok=True)
         with open(full_path, 'wb') as f:
             f.write(content)
 
     def delete_file(self, relative_path: str) -> None:
         """Delete a file from the share."""
-        full_path = Path(self.path) / relative_path
+        # Validate path to prevent traversal attacks
+        validated_path = self._validate_relative_path(relative_path)
+        full_path = Path(self.path) / validated_path
         if full_path.exists():
             full_path.unlink()
 
     def delete_directory(self, relative_path: str) -> None:
         """Delete a directory from the share."""
-        full_path = Path(self.path) / relative_path
+        # Validate path to prevent traversal attacks
+        validated_path = self._validate_relative_path(relative_path)
+        full_path = Path(self.path) / validated_path
         if full_path.exists() and full_path.is_dir():
             shutil.rmtree(full_path)
 
     def create_directory(self, relative_path: str) -> None:
         """Create a directory on the share."""
-        full_path = Path(self.path) / relative_path
+        # Validate path to prevent traversal attacks
+        validated_path = self._validate_relative_path(relative_path)
+        full_path = Path(self.path) / validated_path
         full_path.mkdir(parents=True, exist_ok=True)

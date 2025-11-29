@@ -4,7 +4,10 @@
       "Bash(mkdir:*)",
       "Bash(tree:*)",
       "Bash(dir:*)",
-      "Bash(nul)"
+      "Bash(nul)",
+      "Bash(findstr:*)",
+      "Bash(find:*)",
+      "Bash(cat:*)"
     ],
     "deny": [],
     "ask": []

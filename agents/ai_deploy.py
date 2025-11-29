@@ -2,6 +2,8 @@
 import os
 import json
 import fnmatch
+import glob
+import time
 from datetime import datetime
 from typing import Dict, Any, List, Set, Optional, Tuple
 from pathlib import Path
@@ -12,6 +14,7 @@ from core.agent_base import AgentBase
 from handlers.windows_share_handler import WindowsShareHandler
 from handlers.ssh_handler import SSHHandler
 from handlers.database_handler import DatabaseHandler
+from utils.ssh_connection_pool import SSHConnectionPool
 
 
 class AiDeployAgent(AgentBase):
@@ -26,8 +29,36 @@ class AiDeployAgent(AgentBase):
         self.config_path = config_path
         self.cache_data = {}
         self.deployment_made_changes = False
-        self._transfer_lock = Lock()  # Thread-safe lock for SSH operations
+        self.source_pool = None  # Connection pool for source (if SSH)
+        self.dest_pool = None  # Connection pool for destination (if SSH)
         self.verbose = self.config.get('options', {}).get('verbose', True)  # Default: True for backward compatibility
+
+    @staticmethod
+    def _create_empty_cache() -> Dict[str, Any]:
+        """Create empty cache structure with all required fields."""
+        return {
+            "last_deployment": None,
+            "files": {},
+            "database": {
+                "last_deployment": None,
+                "main_scripts": {},
+                "tenant_scripts": {}
+            },
+            "web_tenants": {},
+            "file_mappings": {}
+        }
+
+    @staticmethod
+    def _normalize_path(path: str) -> str:
+        """Normalize path to use forward slashes for cross-platform comparison."""
+        return path.replace('\\', '/')
+
+    def _log_section(self, title: str, level: str = 'warning') -> None:
+        """Log a section header with separator lines."""
+        log_func = getattr(self.logger, level)
+        log_func("=" * 60)
+        log_func(title)
+        log_func("=" * 60)
 
     def _get_cache_path(self) -> str:
         """
@@ -54,21 +85,7 @@ class AiDeployAgent(AgentBase):
         if not os.path.exists(cache_path):
             if self.verbose:
                 self.logger.info(f"No cache file found at {cache_path}, treating as first deployment")
-            return {
-                "last_deployment": None,
-                "files": {},
-                "css_build": {
-                    "base_css_files": {},
-                    "tenant_configs": {},
-                    "last_built": None
-                },
-                "database": {
-                    "last_deployment": None,
-                    "main_scripts": {},
-                    "tenant_scripts": {}
-                },
-                "web_tenants": {}
-            }
+            return self._create_empty_cache()
 
         try:
             with open(cache_path, 'r', encoding='utf-8') as f:
@@ -79,21 +96,7 @@ class AiDeployAgent(AgentBase):
         except Exception as e:
             self.logger.warning(f"Failed to load cache from {cache_path}: {e}")
             self.logger.warning("Treating as first deployment")
-            return {
-                "last_deployment": None,
-                "files": {},
-                "css_build": {
-                    "base_css_files": {},
-                    "tenant_configs": {},
-                    "last_built": None
-                },
-                "database": {
-                    "last_deployment": None,
-                    "main_scripts": {},
-                    "tenant_scripts": {}
-                },
-                "web_tenants": {}
-            }
+            return self._create_empty_cache()
 
     def _save_cache(self, cache_data: Dict[str, Any]) -> None:
         """
@@ -121,7 +124,7 @@ class AiDeployAgent(AgentBase):
         """
         files_cache = {}
         for f in source_files:
-            normalized_path = f['path'].replace('\\', '/')
+            normalized_path = self._normalize_path(f['path'])
             if not self._should_ignore(normalized_path):
                 files_cache[normalized_path] = {
                     'mtime': f['modified_time'],
@@ -130,46 +133,6 @@ class AiDeployAgent(AgentBase):
 
         self.cache_data['files'] = files_cache
         self.cache_data['last_deployment'] = datetime.utcnow().isoformat() + 'Z'
-
-    def _update_css_build_cache(self, base_css_path: str, tenants: List[Dict]) -> None:
-        """
-        Update cache with CSS build metadata.
-
-        Args:
-            base_css_path: Base path for CSS files
-            tenants: List of tenant configurations
-        """
-        import os
-        import glob
-
-        # Update base CSS files cache
-        base_css_files_cache = {}
-        for css_type in ['public', 'portal']:
-            css_pattern = os.path.join(base_css_path, css_type, 'css', '*.css')
-            css_files = glob.glob(css_pattern)
-            for css_file in css_files:
-                if os.path.exists(css_file):
-                    base_css_files_cache[css_file] = {
-                        'mtime': os.path.getmtime(css_file)
-                    }
-
-        # Update tenant configs cache
-        tenant_configs_cache = {}
-        for tenant in tenants:
-            tenant_name = tenant['name']
-            config_file = tenant['config_file']
-            if os.path.exists(config_file):
-                tenant_configs_cache[tenant_name] = {
-                    'mtime': os.path.getmtime(config_file)
-                }
-
-        # Save to cache
-        if 'css_build' not in self.cache_data:
-            self.cache_data['css_build'] = {}
-
-        self.cache_data['css_build']['base_css_files'] = base_css_files_cache
-        self.cache_data['css_build']['tenant_configs'] = tenant_configs_cache
-        self.cache_data['css_build']['last_built'] = datetime.utcnow().isoformat() + 'Z'
 
     def _validate_config(self, config: Dict[str, Any]) -> None:
         """Validate the configuration structure."""
@@ -196,15 +159,20 @@ class AiDeployAgent(AgentBase):
         if 'database' in config:
             self._validate_database_config(config['database'])
 
-        # Validate warn option if present
+        # Validate warn option if present (support both boolean and dict formats)
         if 'warn' in config:
             warn_config = config['warn']
-            if not isinstance(warn_config, dict):
-                raise ValueError("warn must be a dictionary")
-            if 'enabled' not in warn_config:
-                raise ValueError("warn.enabled is required")
-            if not isinstance(warn_config['enabled'], bool):
-                raise ValueError("warn.enabled must be a boolean")
+            # Support both "warn": true and "warn": {"enabled": true}
+            if isinstance(warn_config, bool):
+                # Convert boolean to dict format internally
+                config['warn'] = {'enabled': warn_config}
+            elif isinstance(warn_config, dict):
+                if 'enabled' not in warn_config:
+                    raise ValueError("warn.enabled is required")
+                if not isinstance(warn_config['enabled'], bool):
+                    raise ValueError("warn.enabled must be a boolean")
+            else:
+                raise ValueError("warn must be a boolean or dictionary")
 
         # Validate options if present
         if 'options' in config:
@@ -219,6 +187,11 @@ class AiDeployAgent(AgentBase):
             # Validate clean_install
             if 'clean_install' in options and not isinstance(options['clean_install'], bool):
                 raise ValueError("options.clean_install must be a boolean")
+
+            # Validate warn (deprecated location, moved to root level)
+            if 'warn' in options:
+                if not isinstance(options['warn'], bool):
+                    raise ValueError("options.warn must be a boolean (deprecated - use root level 'warn' instead)")
 
             # Validate max_concurrent_transfers
             if 'max_concurrent_transfers' in options:
@@ -299,29 +272,6 @@ class AiDeployAgent(AgentBase):
             if not isinstance(ignore_config, dict):
                 raise ValueError("website.ignore must be a dictionary")
 
-        # Validate tenant-website config if present
-        if 'tenant-website' in website:
-            self._validate_tenant_website_config(website['tenant-website'])
-
-    def _validate_tenant_website_config(self, tenant_website: Dict[str, Any]) -> None:
-        """Validate tenant-website configuration."""
-        if not isinstance(tenant_website, dict):
-            raise ValueError("website.tenant-website must be a dictionary")
-
-        if not tenant_website.get('enabled', False):
-            return  # Tenant website deployment is disabled
-
-        # Validate build_css if present
-        if 'build_css' in tenant_website and tenant_website['build_css']:
-            if 'base_css_path' not in tenant_website:
-                raise ValueError("website.tenant-website.base_css_path is required when build_css is true")
-            if 'generated_css_path' not in tenant_website:
-                raise ValueError("website.tenant-website.generated_css_path is required when build_css is true")
-
-        # Validate assets_path template
-        if 'assets_path' not in tenant_website:
-            raise ValueError("website.tenant-website.assets_path is required when enabled")
-
     def _validate_database_config(self, database: Dict[str, Any]) -> None:
         """Validate database configuration."""
         if not database.get('enabled', False):
@@ -370,62 +320,6 @@ class AiDeployAgent(AgentBase):
                 if 'db_password' not in tenant_db_config:
                     raise ValueError("database.tenant-database must have 'db_password' when enabled")
 
-        # Validate seed_tables configuration if present
-        if 'seed_tables' in database:
-            seed_tables = database['seed_tables']
-            if not isinstance(seed_tables, dict):
-                raise ValueError("seed_tables must be a dictionary")
-
-            if seed_tables.get('enabled', False):
-                # Check required fields
-                if 'config_files_path' not in seed_tables:
-                    raise ValueError("seed_tables must have 'config_files_path' when enabled")
-                if 'tables' not in seed_tables:
-                    raise ValueError("seed_tables must have 'tables' when enabled")
-
-                # Validate config_files_path exists
-                config_files_path = seed_tables['config_files_path']
-                if not os.path.exists(config_files_path):
-                    raise ValueError(f"seed_tables config_files_path does not exist: {config_files_path}")
-                if not os.path.isdir(config_files_path):
-                    raise ValueError(f"seed_tables config_files_path is not a directory: {config_files_path}")
-
-                # Validate tables array
-                tables = seed_tables['tables']
-                if not isinstance(tables, list):
-                    raise ValueError("seed_tables 'tables' must be an array")
-                if len(tables) == 0:
-                    raise ValueError("seed_tables 'tables' array cannot be empty when enabled")
-
-                # Validate each table definition
-                for idx, table_def in enumerate(tables):
-                    if not isinstance(table_def, dict):
-                        raise ValueError(f"seed_tables.tables[{idx}] must be a dictionary")
-
-                    # Required fields
-                    required_table_fields = ['table_name', 'table_script_file', 'begin_mark', 'end_mark', 'variables']
-                    for field in required_table_fields:
-                        if field not in table_def:
-                            raise ValueError(f"seed_tables.tables[{idx}] missing '{field}' field")
-
-                    # Validate table_script_file exists
-                    table_script_file = table_def['table_script_file']
-                    if not os.path.exists(table_script_file):
-                        raise ValueError(f"seed_tables.tables[{idx}] table_script_file does not exist: {table_script_file}")
-
-                    # Validate variables array
-                    variables = table_def['variables']
-                    if not isinstance(variables, list):
-                        raise ValueError(f"seed_tables.tables[{idx}] 'variables' must be an array")
-
-                    # Validate each variable definition
-                    for var_idx, var_def in enumerate(variables):
-                        if not isinstance(var_def, dict):
-                            raise ValueError(f"seed_tables.tables[{idx}].variables[{var_idx}] must be a dictionary")
-                        if 'sql_var' not in var_def:
-                            raise ValueError(f"seed_tables.tables[{idx}].variables[{var_idx}] missing 'sql_var' field")
-                        if 'json_field' not in var_def:
-                            raise ValueError(f"seed_tables.tables[{idx}].variables[{var_idx}] missing 'json_field' field")
 
     def _validate_file_mappings(self, file_mappings: List[Dict[str, str]]) -> None:
         """Validate file mappings configuration."""
@@ -459,11 +353,15 @@ class AiDeployAgent(AgentBase):
         tenant_configs = []
 
         # Get all JSON files in the directory
-        import glob
         pattern = os.path.join(config_files_path, f'*{config_files_extension}')
         config_files = sorted(glob.glob(pattern))
 
         for config_file in config_files:
+            # Skip example files and README
+            filename = os.path.basename(config_file).lower()
+            if 'example' in filename or 'readme' in filename or 'template' in filename:
+                continue
+
             try:
                 with open(config_file, 'r', encoding='utf-8') as f:
                     tenant_data = json.load(f)
@@ -499,52 +397,6 @@ class AiDeployAgent(AgentBase):
         # Add more template variables as needed
 
         return result
-
-    def _build_tenant_website_configs(self) -> List[Dict[str, Any]]:
-        """
-        Build tenant website configurations from template and tenant data.
-
-        Returns:
-            List of tenant website configurations
-        """
-        website_config = self.config.get('website', {})
-        tenant_website_config = website_config.get('tenant-website', {})
-
-        if not tenant_website_config.get('enabled', False):
-            return []
-
-        tenant_configs = self._load_tenant_configs()
-        if not tenant_configs:
-            self.logger.warning("No tenant configurations found")
-            return []
-
-        tenant_website_configs = []
-
-        for tenant_data in tenant_configs:
-            webid = tenant_data.get('webid')
-            name = tenant_data.get('name', webid)
-
-            if not webid:
-                self.logger.warning(f"Tenant config missing 'webid' field: {tenant_data.get('_config_file_path')}")
-                continue
-
-            # Build tenant-specific config by replacing template variables
-            assets_path = self._replace_template_variables(
-                tenant_website_config.get('assets_path', ''),
-                tenant_data
-            )
-
-            tenant_config = {
-                'name': webid,  # Use webid as the name
-                'webid': webid,
-                'display_name': name,
-                'config_file': tenant_data.get('_config_file_path'),
-                'assets_path': assets_path
-            }
-
-            tenant_website_configs.append(tenant_config)
-
-        return tenant_website_configs
 
     def _build_tenant_database_configs(self) -> List[Dict[str, Any]]:
         """
@@ -592,6 +444,8 @@ class AiDeployAgent(AgentBase):
                 db_config['tables_path'] = tenant_db_config['tables_path']
             if 'procedures_path' in tenant_db_config:
                 db_config['procedures_path'] = tenant_db_config['procedures_path']
+            if 'data_path' in tenant_db_config:
+                db_config['data_path'] = tenant_db_config['data_path']
             if 'seeds_path' in tenant_db_config:
                 db_config['seeds_path'] = tenant_db_config['seeds_path']
 
@@ -706,7 +560,7 @@ class AiDeployAgent(AgentBase):
         # Create dictionaries for quick lookup
         source_dict = {}
         for f in source_files:
-            normalized_path = f['path'].replace('\\', '/')
+            normalized_path = self._normalize_path(f['path'])
             if not self._should_ignore(normalized_path):
                 # Store with normalized path but keep original file info
                 f_copy = f.copy()
@@ -715,7 +569,7 @@ class AiDeployAgent(AgentBase):
 
         dest_dict = {}
         for f in dest_files:
-            normalized_path = f['path'].replace('\\', '/')
+            normalized_path = self._normalize_path(f['path'])
             f_copy = f.copy()
             f_copy['path'] = normalized_path
             dest_dict[normalized_path] = f_copy
@@ -770,7 +624,7 @@ class AiDeployAgent(AgentBase):
     def _transfer_file_worker(self, file_info: Dict, operation: str, dry_run: bool) -> Tuple[bool, str, str]:
         """
         Worker function for parallel file transfers.
-        Uses a lock to ensure thread-safe SSH operations.
+        Uses connection pools for SSH to enable true parallelism.
 
         Args:
             file_info: File information dictionary with 'path' key
@@ -782,26 +636,41 @@ class AiDeployAgent(AgentBase):
         """
         file_path = file_info['path'] if isinstance(file_info, dict) else file_info
 
+        # Get handlers from pools or use main handler
+        source_handler = self.source_pool.get_handler() if self.source_pool else self.source_handler
+        dest_handler = self.dest_pool.get_handler() if self.dest_pool else self.dest_handler
+
         try:
+            # Check if we got valid handlers from the pool
+            if source_handler is None and self.source_pool:
+                return (False, file_path, 'Timeout waiting for source connection from pool')
+            if dest_handler is None and self.dest_pool:
+                return (False, file_path, 'Timeout waiting for destination connection from pool')
+
             if operation in ['copy', 'update']:
                 if not dry_run:
-                    # Use lock to prevent concurrent SSH operations
-                    with self._transfer_lock:
-                        content = self.source_handler.read_file(file_path)
-                        self.dest_handler.write_file(file_path, content)
+                    content = source_handler.read_file(file_path)
+                    dest_handler.write_file(file_path, content)
             elif operation == 'delete':
                 if not dry_run:
-                    with self._transfer_lock:
-                        self.dest_handler.delete_file(file_path)
+                    dest_handler.delete_file(file_path)
 
             return (True, file_path, '')
         except Exception as e:
-            return (False, file_path, str(e))
+            # Include exception type for better debugging
+            error_msg = f"{type(e).__name__}: {str(e)}"
+            return (False, file_path, error_msg)
+        finally:
+            # Return handlers to pools
+            if self.source_pool and source_handler:
+                self.source_pool.return_handler(source_handler)
+            if self.dest_pool and dest_handler:
+                self.dest_pool.return_handler(dest_handler)
 
     def _sync_files(self, new_files: List[Dict], modified_files: List[Dict], deleted_files: List[str]) -> None:
         """
         Synchronize files from source to destination using parallel transfers.
-        Note: SSH connections are not thread-safe, so we use sequential processing for SSH.
+        Creates connection pools for SSH to enable true parallelism.
 
         Args:
             new_files: List of new files to copy
@@ -811,14 +680,32 @@ class AiDeployAgent(AgentBase):
         dry_run = self.config.get('options', {}).get('dry_run', False)
         max_workers = self.config.get('options', {}).get('max_concurrent_transfers', 20)
 
-        # SSH connections are not thread-safe - use sequential processing
-        # Only use parallel transfers for Windows share destinations
-        is_ssh = (self.config.get('source', {}).get('type') == 'ssh' or
-                  self.config.get('destination', {}).get('type') == 'ssh')
+        # Check if source or destination uses SSH
+        is_source_ssh = self.config.get('source', {}).get('type') == 'ssh'
+        is_dest_ssh = self.config.get('destination', {}).get('type') == 'ssh'
 
-        if is_ssh:
-            max_workers = 1  # Sequential for SSH to avoid deadlocks
-            self.logger.info("Using sequential file transfers (SSH is not thread-safe)")
+        # Initialize connection pools for SSH (one pool per SSH endpoint)
+        if is_source_ssh and max_workers > 1:
+            pool_size = max_workers  # Match pool size to max workers to avoid timeouts
+            self.source_pool = SSHConnectionPool(self.config['source'], pool_size)
+            self.source_pool.initialize()
+            if self.verbose:
+                self.logger.info(f"Created SSH connection pool for source ({pool_size} connections)")
+
+        if is_dest_ssh and max_workers > 1:
+            pool_size = max_workers  # Match pool size to max workers to avoid timeouts
+            # Merge destination config with website path
+            website_config = self.config.get('website', {})
+            dest_config = self.config['destination'].copy()
+            if 'path' in website_config:
+                dest_config['path'] = website_config['path']
+            self.dest_pool = SSHConnectionPool(dest_config, pool_size)
+            self.dest_pool.initialize()
+            if self.verbose:
+                self.logger.info(f"Created SSH connection pool for destination ({pool_size} connections)")
+
+        if (is_source_ssh or is_dest_ssh) and max_workers > 1:
+            self.logger.info(f"Using {max_workers} parallel file transfers with connection pooling")
 
         # Copy new files in parallel
         if new_files:
@@ -988,7 +875,7 @@ class AiDeployAgent(AgentBase):
             main_database_scripts = database_config.get('main_database_scripts')
             if main_database_scripts:
                 # Check all script directories
-                for script_type in ['setup_path', 'tables_path', 'procedures_path', 'seeds_path']:
+                for script_type in ['setup_path', 'tables_path', 'procedures_path', 'data_path', 'seeds_path']:
                     script_path = main_database_scripts.get(script_type)
                     if script_path and os.path.exists(script_path):
                         if os.path.isfile(script_path):
@@ -1028,28 +915,18 @@ class AiDeployAgent(AgentBase):
                                                 self.logger.debug(f"Database file changed: {file_path}")
                                                 return True
 
-            # Check seed tables config files and table script files
-            seed_tables_config = database_config.get('seed_tables')
-            if seed_tables_config and seed_tables_config.get('enabled', False):
-                # Check config files
-                config_files_path = seed_tables_config.get('config_files_path')
-                config_files_extension = seed_tables_config.get('config_files_extension', '.json')
-                if config_files_path and os.path.exists(config_files_path) and os.path.isdir(config_files_path):
-                    for file in os.listdir(config_files_path):
-                        if file.endswith(config_files_extension):
-                            file_path = os.path.join(config_files_path, file)
-                            if os.path.getmtime(file_path) > last_deployment_timestamp:
-                                self.logger.debug(f"Seed config file changed: {file_path}")
-                                return True
-
-                # Check table script files
-                tables = seed_tables_config.get('tables', [])
-                for table_def in tables:
-                    table_script_file = table_def.get('table_script_file')
-                    if table_script_file and os.path.exists(table_script_file):
-                        if os.path.getmtime(table_script_file) > last_deployment_timestamp:
-                            self.logger.debug(f"Table script file changed: {table_script_file}")
-                            return True
+            # Check tenant data scripts
+            tenant_data_scripts = database_config.get('tenant_data_scripts')
+            if tenant_data_scripts and tenant_data_scripts.get('enabled'):
+                data_path = tenant_data_scripts.get('data_path')
+                if data_path and os.path.exists(data_path) and os.path.isdir(data_path):
+                    for root, dirs, files in os.walk(data_path):
+                        for file in files:
+                            if file.endswith('.sql'):
+                                file_path = os.path.join(root, file)
+                                if os.path.getmtime(file_path) > last_deployment_timestamp:
+                                    self.logger.debug(f"Tenant data file changed: {file_path}")
+                                    return True
 
             return False
 
@@ -1107,6 +984,7 @@ class AiDeployAgent(AgentBase):
             admin_username = database_config.get('admin_username')
             admin_password = database_config.get('admin_password')
             main_database_scripts = database_config.get('main_database_scripts')
+            tenant_data_scripts = database_config.get('tenant_data_scripts')
 
             # Build dynamic tenant database configs from tenant data
             tenant_database_scripts = self._build_tenant_database_configs()
@@ -1117,86 +995,15 @@ class AiDeployAgent(AgentBase):
                 admin_password=admin_password,
                 main_database_scripts=main_database_scripts,
                 tenant_database_scripts=tenant_database_scripts,
+                tenant_data_scripts=tenant_data_scripts,
                 dry_run=dry_run,
                 last_deployment_timestamp=last_deployment_timestamp,
                 application_name=self.config.get('application_name')
             )
 
-            # Seed tables from config files if configured
-            # Tables can be seeded on either main database or tenant databases
-            # based on the "database" field in each table definition
-            seed_tables_config = database_config.get('seed_tables')
-            if seed_tables_config and seed_tables_config.get('enabled', False):
-                all_tables = seed_tables_config.get('tables', [])
-
-                # Separate tables by target database
-                main_tables = []
-                tenant_tables = []
-
-                for table_def in all_tables:
-                    target_db = table_def.get('database', 'main')  # Default to main if not specified
-                    if target_db == 'tenant':
-                        tenant_tables.append(table_def)
-                    else:
-                        main_tables.append(table_def)
-
-                # Seed main database tables
-                if main_tables and main_database_scripts:
-                    main_db_name = main_database_scripts.get('db_name')
-                    if main_db_name:
-                        self.logger.info("=" * 60)
-                        self.logger.info("SEEDING MAIN DATABASE TABLES FROM CONFIG")
-                        self.logger.info("=" * 60)
-
-                        # Create config with only main tables
-                        main_seed_config = seed_tables_config.copy()
-                        main_seed_config['tables'] = main_tables
-
-                        seed_success, records_inserted = self.db_handler.seed_tables_from_config(
-                            seed_tables_config=main_seed_config,
-                            database_name=main_db_name,
-                            dry_run=dry_run,
-                            application_name=self.config.get('application_name')
-                        )
-                        if not seed_success:
-                            success = False
-                        if records_inserted > 0:
-                            any_scripts_executed = True
-
-                # Seed tenant database tables
-                if tenant_tables and tenant_database_scripts:
-                    self.logger.info("=" * 60)
-                    self.logger.info("SEEDING TENANT DATABASE TABLES FROM CONFIG")
-                    self.logger.info("=" * 60)
-
-                    # Create config with only tenant tables
-                    tenant_seed_config = seed_tables_config.copy()
-                    tenant_seed_config['tables'] = tenant_tables
-
-                    # Seed each tenant database
-                    for tenant_config in tenant_database_scripts:
-                        tenant_db_name = tenant_config.get('db_name')
-                        if tenant_db_name:
-                            self.logger.info("=" * 60)
-                            self.logger.info(f"SEEDING TENANT DATABASE: {tenant_db_name}")
-                            self.logger.info("=" * 60)
-
-                            seed_success, records_inserted = self.db_handler.seed_tables_from_config(
-                                seed_tables_config=tenant_seed_config,
-                                database_name=tenant_db_name,
-                                dry_run=dry_run,
-                                is_tenant_db=True,
-                                application_name=self.config.get('application_name')
-                            )
-                            if not seed_success:
-                                success = False
-                            if records_inserted > 0:
-                                any_scripts_executed = True
-
             if success:
                 # Update cache with current timestamp only if scripts were executed
                 if not dry_run and any_scripts_executed:
-                    import time
                     self.deployment_made_changes = True
                     if 'database' not in self.cache_data:
                         self.cache_data['database'] = {}
@@ -1235,6 +1042,7 @@ class AiDeployAgent(AgentBase):
             # Check if destination is SSH (most efficient for recursive deletion)
             if self.config['destination']['type'] == 'ssh' and hasattr(self.dest_handler, 'ssh_client'):
                 ssh_client = self.dest_handler.ssh_client
+                ssh_password = self.config['destination'].get('password', '')
 
                 if dry_run:
                     # List what would be deleted
@@ -1249,16 +1057,31 @@ class AiDeployAgent(AgentBase):
                     if len(items) > 10:
                         self.logger.info(f"  [DRY RUN] ... and {len(items) - 10} more items")
                 else:
-                    # Use rm -rf to recursively delete all contents (but not the directory itself)
-                    delete_cmd = f"rm -rf {website_path}/*"
+                    # Use sudo rm -rf to recursively delete all contents (handles permission issues)
+                    # Delete hidden files separately to avoid issues with .* expansion
+                    delete_cmd = f"echo '{ssh_password}' | sudo -S bash -c 'rm -rf {website_path}/* {website_path}/.[!.]* {website_path}/..?*' 2>&1"
                     stdin, stdout, stderr = ssh_client.exec_command(delete_cmd)
+
+                    # Read output and filter sudo password prompts
+                    output = stdout.read().decode()
                     exit_status = stdout.channel.recv_exit_status()
+
+                    # Filter out sudo password prompts and "No such file" errors for hidden files
+                    error_lines = [line for line in output.split('\n')
+                                  if line.strip()
+                                  and '[sudo]' not in line.lower()
+                                  and 'password' not in line.lower()
+                                  and 'no such file or directory' not in line.lower()]
 
                     if exit_status == 0:
                         self.logger.info(f"✓ Successfully deleted all contents of {website_path}")
                     else:
-                        error = stderr.read().decode()
-                        self.logger.error(f"Error deleting directory contents: {error}")
+                        # Only log actual errors
+                        if error_lines:
+                            self.logger.error(f"Error deleting directory contents: {chr(10).join(error_lines)}")
+                        else:
+                            # Exit status non-zero but no real errors (probably just missing hidden files)
+                            self.logger.info(f"✓ Successfully deleted all contents of {website_path}")
 
             else:
                 # Fallback for non-SSH: list recursively and delete in reverse order (deepest first)
@@ -1319,8 +1142,6 @@ class AiDeployAgent(AgentBase):
         try:
             # Create database handler if needed
             if not self.db_handler:
-                from handlers.database_handler import DatabaseHandler
-
                 self.db_handler = DatabaseHandler(
                     ssh_host=database_config.get('ssh_host'),
                     ssh_port=database_config.get('ssh_port', 22),
@@ -1484,254 +1305,6 @@ class AiDeployAgent(AgentBase):
         except Exception as e:
             self.logger.error(f"Error executing permissions script: {e}")
 
-    def _extract_css_variables_from_config(self, config_file_path: str) -> Dict[str, str]:
-        """
-        Extract CSS variables from a JSON config file.
-
-        Args:
-            config_file_path: Path to the JSON config file
-
-        Returns:
-            Dictionary of CSS variable names and values
-        """
-        import json
-
-        try:
-            with open(config_file_path, 'r', encoding='utf-8') as f:
-                config = json.load(f)
-
-            # Extract css_variables from the JSON config
-            css_variables = config.get('css_variables', {})
-            return css_variables
-
-        except Exception as e:
-            self.logger.error(f"Error extracting CSS variables from {config_file_path}: {e}")
-            return {}
-
-    def _tenant_css_needs_rebuild(self, tenant_name: str, config_file: str, base_css_path: str) -> bool:
-        """
-        Check if tenant CSS needs to be rebuilt.
-
-        Args:
-            tenant_name: Name of the tenant
-            config_file: Path to tenant config file
-            base_css_path: Base path for CSS files
-
-        Returns:
-            True if CSS needs to be rebuilt, False otherwise
-        """
-        import os
-        import glob
-
-        css_cache = self.cache_data.get('css_build', {})
-        tenant_configs = css_cache.get('tenant_configs', {})
-        base_css_files_cache = css_cache.get('base_css_files', {})
-
-        # Check if tenant config file changed
-        if os.path.exists(config_file):
-            config_mtime = os.path.getmtime(config_file)
-            cached_mtime = tenant_configs.get(tenant_name, {}).get('mtime', 0)
-            if config_mtime > cached_mtime:
-                return True
-        else:
-            # Config file doesn't exist, can't build
-            return False
-
-        # Check if any base CSS files changed
-        for css_type in ['public', 'portal']:
-            css_pattern = os.path.join(base_css_path, css_type, 'css', '*.css')
-            css_files = glob.glob(css_pattern)
-
-            for css_file in css_files:
-                css_mtime = os.path.getmtime(css_file)
-                cached_mtime = base_css_files_cache.get(css_file, {}).get('mtime', 0)
-                if css_mtime > cached_mtime:
-                    return True
-
-        # No changes detected
-        return False
-
-    def _build_tenant_css(self) -> None:
-        """Build CSS files for each tenant by prepending color variables."""
-        website_config = self.config.get('website', {})
-        tenant_website_config = website_config.get('tenant-website', {})
-
-        if not tenant_website_config.get('enabled', False):
-            return
-
-        if not tenant_website_config.get('build_css', False):
-            return
-
-        import os
-        import glob
-        import re
-
-        dry_run = self.config.get('options', {}).get('dry_run', False)
-        ignore_cache = self.config.get('options', {}).get('ignore_cache', False)
-
-        self.logger.info("=" * 60)
-        self.logger.info("BUILDING TENANT CSS")
-        self.logger.info("=" * 60)
-
-        base_css_path = tenant_website_config['base_css_path']
-        generated_css_path = tenant_website_config['generated_css_path']
-
-        # Build dynamic tenant list from tenant configs
-        tenants = self._build_tenant_website_configs()
-
-        if not tenants:
-            self.logger.warning("No tenant configurations found for CSS building")
-            return
-
-        css_built_for_any_tenant = False
-
-        for tenant in tenants:
-            tenant_name = tenant['name']
-            config_file = tenant['config_file']
-
-            # Check if CSS needs to be rebuilt for this tenant
-            if not ignore_cache:
-                needs_rebuild = self._tenant_css_needs_rebuild(
-                    tenant_name, config_file, base_css_path
-                )
-                if not needs_rebuild:
-                    if self.verbose:
-                        self.logger.info(f"Skipping CSS build for tenant '{tenant_name}' (no changes detected)")
-                    continue
-
-            self.logger.info(f"Building CSS for tenant: {tenant_name}")
-            css_built_for_any_tenant = True
-
-            # Extract CSS variables from JSON config
-            css_vars_dict = self._extract_css_variables_from_config(config_file)
-
-            if not css_vars_dict:
-                self.logger.warning(f"  No CSS variables found in {config_file}")
-                continue
-
-            # Process public CSS files
-            public_css_pattern = os.path.join(base_css_path, 'public', 'css', '*.css')
-            public_css_files = glob.glob(public_css_pattern)
-
-            for css_file in public_css_files:
-                filename = os.path.basename(css_file)
-                output_dir = os.path.join(generated_css_path, tenant_name, 'public')
-                output_file = os.path.join(output_dir, filename)
-
-                if dry_run:
-                    self.logger.info(f"  [DRY RUN] Would generate: {output_file}")
-                else:
-                    # Create output directory
-                    os.makedirs(output_dir, exist_ok=True)
-
-                    # Read original CSS
-                    with open(css_file, 'r', encoding='utf-8') as f:
-                        original_css = f.read()
-
-                    # Extract non-color CSS variables from :root block
-                    non_color_vars = {}
-                    root_match = re.search(r':root\s*\{([^}]*)\}', original_css, re.DOTALL)
-                    if root_match:
-                        root_content = root_match.group(1)
-                        for var_match in re.finditer(r'--([a-z0-9\-]+)\s*:\s*([^;]+);', root_content):
-                            var_name = var_match.group(1)
-                            var_value = var_match.group(2).strip()
-                            # Keep non-color variables (not starting with 'c-')
-                            if not var_name.startswith('c-'):
-                                non_color_vars[f'--{var_name}'] = var_value
-
-                    # Build new :root block with tenant CSS variables + non-color vars
-                    css_vars = ":root{\n"
-                    for key, value in css_vars_dict.items():
-                        css_key = key.replace('_', '-')
-                        # Variables starting with 'c_' get '--c-' prefix, others get '--' prefix only
-                        if key.startswith('c_'):
-                            css_vars += f"  --{css_key}:{value};\n"
-                        else:
-                            css_vars += f"  --{css_key}:{value};\n"
-                    for var_name, var_value in non_color_vars.items():
-                        css_vars += f"  {var_name}:{var_value};\n"
-                    css_vars += "}\n\n"
-
-                    # Strip old :root block
-                    cleaned_css = re.sub(r':root\s*\{[^}]*\}', '', original_css, flags=re.DOTALL)
-
-                    # Replace tenant paths /(demo|livingwater)/ with /tenants/{tenant_name}/
-                    cleaned_css = re.sub(r'/(demo|livingwater)/', f'/tenants/{tenant_name}/', cleaned_css)
-
-                    # Write generated CSS
-                    with open(output_file, 'w', encoding='utf-8') as f:
-                        f.write(css_vars)
-                        f.write(cleaned_css)
-
-                    self.logger.info(f"  ✓ Generated: public/{filename}")
-
-            # Process portal CSS files
-            portal_css_pattern = os.path.join(base_css_path, 'portal', 'css', '*.css')
-            portal_css_files = glob.glob(portal_css_pattern)
-
-            for css_file in portal_css_files:
-                filename = os.path.basename(css_file)
-                output_dir = os.path.join(generated_css_path, tenant_name, 'portal')
-                output_file = os.path.join(output_dir, filename)
-
-                if dry_run:
-                    self.logger.info(f"  [DRY RUN] Would generate: {output_file}")
-                else:
-                    # Create output directory
-                    os.makedirs(output_dir, exist_ok=True)
-
-                    # Read original CSS
-                    with open(css_file, 'r', encoding='utf-8') as f:
-                        original_css = f.read()
-
-                    # Extract non-color CSS variables from :root block
-                    non_color_vars = {}
-                    root_match = re.search(r':root\s*\{([^}]*)\}', original_css, re.DOTALL)
-                    if root_match:
-                        root_content = root_match.group(1)
-                        for var_match in re.finditer(r'--([a-z0-9\-]+)\s*:\s*([^;]+);', root_content):
-                            var_name = var_match.group(1)
-                            var_value = var_match.group(2).strip()
-                            # Keep non-color variables (not starting with 'c-')
-                            if not var_name.startswith('c-'):
-                                non_color_vars[f'--{var_name}'] = var_value
-
-                    # Build new :root block with tenant CSS variables + non-color vars
-                    css_vars = ":root{\n"
-                    for key, value in css_vars_dict.items():
-                        css_key = key.replace('_', '-')
-                        # Variables starting with 'c_' get '--c-' prefix, others get '--' prefix only
-                        if key.startswith('c_'):
-                            css_vars += f"  --{css_key}:{value};\n"
-                        else:
-                            css_vars += f"  --{css_key}:{value};\n"
-                    for var_name, var_value in non_color_vars.items():
-                        css_vars += f"  {var_name}:{var_value};\n"
-                    css_vars += "}\n\n"
-
-                    # Strip old :root block
-                    cleaned_css = re.sub(r':root\s*\{[^}]*\}', '', original_css, flags=re.DOTALL)
-
-                    # Replace tenant paths /(demo|livingwater)/ with /tenants/{tenant_name}/
-                    cleaned_css = re.sub(r'/(demo|livingwater)/', f'/tenants/{tenant_name}/', cleaned_css)
-
-                    # Write generated CSS
-                    with open(output_file, 'w', encoding='utf-8') as f:
-                        f.write(css_vars)
-                        f.write(cleaned_css)
-
-                    self.logger.info(f"  ✓ Generated: portal/{filename}")
-
-        # Update cache if CSS was built for any tenant
-        if css_built_for_any_tenant:
-            self.deployment_made_changes = True
-            self._update_css_build_cache(base_css_path, tenants)
-
-        self.logger.info("=" * 60)
-        self.logger.info("Tenant CSS building completed!")
-        self.logger.info("=" * 60)
-
     def _tenant_needs_deployment(self, tenant_name: str, config_file: str, assets_path: str, generated_css_path: str = None) -> bool:
         """
         Check if a tenant needs to be deployed by comparing file modification times.
@@ -1745,8 +1318,6 @@ class AiDeployAgent(AgentBase):
         Returns:
             True if tenant needs deployment, False if unchanged
         """
-        import glob
-
         web_tenants_cache = self.cache_data.get('web_tenants', {})
         tenant_cache = web_tenants_cache.get(tenant_name, {})
 
@@ -1787,8 +1358,6 @@ class AiDeployAgent(AgentBase):
 
     def _update_web_tenant_cache(self, tenant_name: str, config_file: str, assets_path: str, generated_css_path: str = None) -> None:
         """Update cache with current tenant file metadata."""
-        import glob
-
         if 'web_tenants' not in self.cache_data:
             self.cache_data['web_tenants'] = {}
 
@@ -1827,143 +1396,6 @@ class AiDeployAgent(AgentBase):
                     tenant_cache['css_files'][css_file] = {}
                 tenant_cache['css_files'][css_file]['mtime'] = os.path.getmtime(css_file)
 
-    def _deploy_web_tenants(self) -> None:
-        """Deploy tenant config files, assets, and generated CSS to destination."""
-        website_config = self.config.get('website', {})
-        tenant_website_config = website_config.get('tenant-website', {})
-
-        if not tenant_website_config.get('enabled', False):
-            return
-
-        dry_run = self.config.get('options', {}).get('dry_run', False)
-        ignore_cache = self.config.get('options', {}).get('ignore_cache', False)
-
-        self.logger.info("=" * 60)
-        self.logger.info("DEPLOYING WEB TENANTS")
-        self.logger.info("=" * 60)
-
-        tenants_deployed = 0
-
-        dest_base_path = website_config.get('path')
-        generated_css_path = tenant_website_config.get('generated_css_path')
-
-        # Build dynamic tenant list from tenant configs
-        tenants = self._build_tenant_website_configs()
-
-        if not tenants:
-            self.logger.warning("No tenant configurations found for deployment")
-            return
-
-        for tenant in tenants:
-            tenant_name = tenant['name']
-            config_file = tenant.get('config_file')
-            assets_path = tenant['assets_path']
-
-            # Check if tenant needs deployment
-            tenant_css_path = os.path.join(generated_css_path, tenant_name) if generated_css_path else None
-
-            if not ignore_cache:
-                needs_deployment = self._tenant_needs_deployment(
-                    tenant_name, config_file, assets_path, tenant_css_path
-                )
-                if not needs_deployment:
-                    if self.verbose:
-                        self.logger.info(f"Skipping tenant '{tenant_name}' (no changes detected)")
-                    continue
-
-            self.logger.info(f"Deploying tenant: {tenant_name}")
-
-            # 1. Deploy config file
-            if config_file:
-                config_filename = os.path.basename(config_file)
-                dest_config_path = f"web/tenants/_config/{config_filename}"
-
-                try:
-                    if dry_run:
-                        self.logger.info(f"  [DRY RUN] Would deploy config: {dest_config_path}")
-                    else:
-                        with open(config_file, 'rb') as f:
-                            content = f.read()
-                        self.dest_handler.write_file(dest_config_path, content)
-                        self.logger.info(f"  ✓ Deployed config: {config_filename}")
-                except Exception as e:
-                    self.logger.error(f"  Error deploying config {config_filename}: {e}")
-
-            # 2. Deploy assets
-            if os.path.exists(assets_path):
-                try:
-                    import glob
-
-                    # Get all files in assets directory recursively
-                    assets_pattern = os.path.join(assets_path, '**', '*')
-                    asset_files = [f for f in glob.glob(assets_pattern, recursive=True) if os.path.isfile(f)]
-
-                    for asset_file in asset_files:
-                        # Calculate relative path from assets_path
-                        rel_path = os.path.relpath(asset_file, assets_path)
-                        # Convert to forward slashes for destination
-                        rel_path = rel_path.replace('\\', '/')
-                        dest_asset_path = f"web/tenants/{tenant_name}/{rel_path}"
-
-                        if dry_run:
-                            self.logger.info(f"  [DRY RUN] Would deploy asset: {rel_path}")
-                        else:
-                            with open(asset_file, 'rb') as f:
-                                content = f.read()
-                            self.dest_handler.write_file(dest_asset_path, content)
-
-                    if not dry_run:
-                        self.logger.info(f"  ✓ Deployed {len(asset_files)} asset file(s)")
-
-                except Exception as e:
-                    self.logger.error(f"  Error deploying assets for {tenant_name}: {e}")
-
-            # 3. Deploy generated CSS
-            if generated_css_path:
-                if os.path.exists(tenant_css_path):
-                    try:
-                        import glob
-
-                        # Get all CSS files recursively
-                        css_pattern = os.path.join(tenant_css_path, '**', '*.css')
-                        css_files = glob.glob(css_pattern, recursive=True)
-
-                        for css_file in css_files:
-                            # Calculate relative path from tenant_css_path
-                            rel_path = os.path.relpath(css_file, tenant_css_path)
-                            # Convert to forward slashes for destination
-                            rel_path = rel_path.replace('\\', '/')
-                            dest_css_path = f"web/generated/css/{tenant_name}/{rel_path}"
-
-                            if dry_run:
-                                self.logger.info(f"  [DRY RUN] Would deploy CSS: {rel_path}")
-                            else:
-                                with open(css_file, 'rb') as f:
-                                    content = f.read()
-                                self.dest_handler.write_file(dest_css_path, content)
-
-                        if not dry_run:
-                            self.logger.info(f"  ✓ Deployed {len(css_files)} CSS file(s)")
-
-                    except Exception as e:
-                        self.logger.error(f"  Error deploying CSS for {tenant_name}: {e}")
-
-            # Update cache for this tenant
-            if not dry_run:
-                self._update_web_tenant_cache(tenant_name, config_file, assets_path, tenant_css_path)
-                tenants_deployed += 1
-
-        # Update change flag if any tenants were deployed
-        if tenants_deployed > 0:
-            self.deployment_made_changes = True
-            self.logger.info(f"Deployed {tenants_deployed} tenant(s)")
-        else:
-            self.logger.info("No tenants needed to be deployed")
-
-        self.logger.info("=" * 60)
-        self.logger.info("Web tenants deployment completed!")
-        self.logger.info("=" * 60)
-
     def _check_confirmation(self) -> bool:
         """
         Check if user confirmation is required and prompt if needed.
@@ -1999,11 +1431,46 @@ class AiDeployAgent(AgentBase):
             self.logger.info("Deployment cancelled by user")
             return False
 
+    def _check_clean_install_confirmation(self) -> bool:
+        """
+        Check if user wants to proceed with clean install (deletes all files and databases).
+
+        Returns:
+            True if clean install should proceed, False if cancelled
+        """
+        print("\n" + "=" * 60)
+        print("CLEAN INSTALL WARNING")
+        print("=" * 60)
+        print("Clean install mode is ENABLED!")
+        print("This will DELETE:")
+        print("  - All files in the destination directory")
+        print("  - All configured databases (main and tenant databases)")
+        print("=" * 60)
+        print("\nType 'DELETE EVERYTHING' to continue or anything else to cancel: ", end='', flush=True)
+
+        try:
+            response = input().strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n")
+            return False
+
+        if response == 'DELETE EVERYTHING':
+            return True
+        else:
+            self.logger.info("Clean install cancelled by user")
+            return False
+
     def run(self) -> None:
         """Execute the deployment/synchronization."""
         # Check for user confirmation if warn is enabled
         if not self._check_confirmation():
             return
+
+        # Check for clean install confirmation if enabled
+        clean_install = self.config.get('options', {}).get('clean_install', False)
+        if clean_install:
+            if not self._check_clean_install_confirmation():
+                return
 
         # Load cache for incremental deployments
         ignore_cache = self.config.get('options', {}).get('ignore_cache', False)
@@ -2036,7 +1503,6 @@ class AiDeployAgent(AgentBase):
             self.dest_handler.connect()
 
             # Perform clean install if requested
-            clean_install = self.config.get('options', {}).get('clean_install', False)
             if clean_install:
                 self.logger.warning("=" * 60)
                 self.logger.warning("CLEAN INSTALL MODE ENABLED")
@@ -2050,14 +1516,7 @@ class AiDeployAgent(AgentBase):
                 self._drop_all_databases()
 
                 # Reset cache since we're starting fresh
-                self.cache_data = {
-                    "last_deployment": None,
-                    "files": {},
-                    "css_build": {},
-                    "database": {},
-                    "file_mappings": {},
-                    "web_tenants": {}
-                }
+                self.cache_data = self._create_empty_cache()
 
             # List files
             if self.verbose:
@@ -2071,9 +1530,6 @@ class AiDeployAgent(AgentBase):
             dest_files = self.dest_handler.list_files(recursive=True)
             if self.verbose:
                 self.logger.info(f"Found {len(dest_files)} files in destination")
-
-            # Build tenant CSS (before synchronization so generated files exist)
-            self._build_tenant_css()
 
             # Compare files
             if self.verbose:
@@ -2093,23 +1549,51 @@ class AiDeployAgent(AgentBase):
             if self.config.get('options', {}).get('dry_run', False):
                 self.logger.warning("DRY RUN MODE - No changes will be made")
 
-            self._sync_files(new_files, modified_files, deleted_files)
+            # Start database deployment in parallel with file sync (if configured)
+            database_future = None
+            if self.config.get('database', {}).get('enabled', False):
+                with ThreadPoolExecutor(max_workers=1) as db_executor:
+                    self.logger.info("=" * 60)
+                    self.logger.info("STARTING DATABASE DEPLOYMENT IN BACKGROUND")
+                    self.logger.info("=" * 60)
+                    database_future = db_executor.submit(self._deploy_database)
 
-            # Update cache with deployed file metadata
-            if new_files or modified_files or deleted_files:
-                self.deployment_made_changes = True
-                self._update_file_cache(source_files)
+                    # Run file sync while database is deploying
+                    self._sync_files(new_files, modified_files, deleted_files)
 
-            self.logger.warning("Synchronization completed successfully!")
+                    # Update cache with deployed file metadata
+                    if new_files or modified_files or deleted_files:
+                        self.deployment_made_changes = True
+                        self._update_file_cache(source_files)
 
-            # Process file mappings (copy files with renamed destinations)
-            self._process_file_mappings()
+                    self.logger.warning("Synchronization completed successfully!")
 
-            # Deploy web tenants (config files, assets, generated CSS)
-            self._deploy_web_tenants()
+                    # Process file mappings (copy files with renamed destinations)
+                    self._process_file_mappings()
 
-            # Deploy database if configured
-            self._deploy_database()
+                    # Wait for database deployment to complete
+                    if database_future:
+                        self.logger.info("=" * 60)
+                        self.logger.info("WAITING FOR DATABASE DEPLOYMENT TO COMPLETE...")
+                        self.logger.info("=" * 60)
+                        try:
+                            database_future.result()  # Wait for completion and raise any exceptions
+                        except Exception as e:
+                            self.logger.error(f"Database deployment failed: {e}")
+                            raise
+            else:
+                # No database deployment, just run file sync
+                self._sync_files(new_files, modified_files, deleted_files)
+
+                # Update cache with deployed file metadata
+                if new_files or modified_files or deleted_files:
+                    self.deployment_made_changes = True
+                    self._update_file_cache(source_files)
+
+                self.logger.warning("Synchronization completed successfully!")
+
+                # Process file mappings (copy files with renamed destinations)
+                self._process_file_mappings()
 
             # Execute permissions script if configured
             self._execute_permissions_script()
@@ -2118,6 +1602,12 @@ class AiDeployAgent(AgentBase):
             self.logger.error(f"Error during deployment: {e}")
             raise
         finally:
+            # Close connection pools if they were created
+            if self.source_pool:
+                self.source_pool.close_all()
+            if self.dest_pool:
+                self.dest_pool.close_all()
+
             # Save cache if changes were made and not in dry-run mode
             dry_run = self.config.get('options', {}).get('dry_run', False)
             if self.deployment_made_changes and not dry_run:

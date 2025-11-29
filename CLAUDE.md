@@ -242,7 +242,7 @@ sudo systemctl restart apache2
 
 The ai-deploy agent supports optional database deployment via SSH tunnel. Database scripts are read from the **local source machine** and executed on the remote MySQL server.
 
-**Configuration:**
+**Configuration Example (Main Database Only):**
 ```json
 {
   "database": {
@@ -253,24 +253,118 @@ The ai-deploy agent supports optional database deployment via SSH tunnel. Databa
     "ssh_password": "password",
     "db_host": "127.0.0.1",
     "db_port": 3306,
-    "db_username": "root",
-    "db_password": "mysql_password",
-    "db_name": "database_name",
-    "scripts": {
-      "create_db": "C:\\path\\to\\create-db.sql",
+    "admin_username": "root",
+    "admin_password": "mysql_password",
+    "main_database_scripts": {
+      "db_name": "myapp_db",
+      "db_username": "myapp_user",
+      "db_password": "dbpassword",
+      "setup_path": "C:\\path\\to\\setup",
       "tables_path": "C:\\path\\to\\tables",
       "procedures_path": "C:\\path\\to\\procs",
+      "data_path": "C:\\path\\to\\data",
       "seeds_path": "C:\\path\\to\\seeds"
     }
   }
 }
 ```
 
+**Configuration Example (Multi-Tenant Databases):**
+```json
+{
+  "database": {
+    "enabled": true,
+    "ssh_host": "192.168.1.4",
+    "ssh_port": 22,
+    "ssh_username": "andy",
+    "ssh_password": "password",
+    "db_host": "127.0.0.1",
+    "db_port": 3306,
+    "admin_username": "root",
+    "admin_password": "mysql_password",
+    "main_database_scripts": {
+      "db_name": "agencyos",
+      "db_username": "agencyos_user",
+      "db_password": "dbpassword",
+      "setup_path": "C:\\git\\agencyos\\database\\main\\setup",
+      "tables_path": "C:\\git\\agencyos\\database\\main\\tables",
+      "procedures_path": "C:\\git\\agencyos\\database\\main\\procedures"
+    },
+    "tenant-database": {
+      "enabled": true,
+      "db_name": "agencyos_{{WEBID}}",
+      "db_username": "agencyos_user",
+      "db_password": "dbpassword",
+      "setup_path": "C:\\git\\agencyos\\database\\tenant\\setup",
+      "tables_path": "C:\\git\\agencyos\\database\\tenant\\tables",
+      "procedures_path": "C:\\git\\agencyos\\database\\tenant\\procedures"
+    },
+    "tenant_data_scripts": {
+      "enabled": true,
+      "data_path": "C:\\git\\agencyos\\database\\tenant\\data"
+    }
+  }
+}
+```
+
+**Database Configuration Sections:**
+
+1. **main_database_scripts**: Scripts for the main database (executed once)
+   - `db_name`: Main database name
+   - `db_username`: Database username
+   - `db_password`: Database password
+   - `setup_path`: Database setup scripts (create database, users, grants)
+   - `tables_path`: Table creation scripts
+   - `procedures_path`: Stored procedure scripts
+   - `data_path`: Data scripts
+   - `seeds_path`: Seed data scripts
+
+2. **tenant-database**: Scripts executed **per tenant** (uses {{WEBID}} template variable)
+   - `db_name`: Tenant database name pattern (e.g., `agencyos_{{WEBID}}`)
+   - `setup_path`: Tenant database setup scripts (executed per tenant)
+   - `tables_path`: Table creation scripts (executed per tenant)
+   - `procedures_path`: Stored procedure scripts (executed per tenant)
+   - `seeds_path`: Seed data scripts (executed per tenant)
+
+3. **tenant_data_scripts**: Scripts executed **once** after all tenant databases are created
+   - `data_path`: SQL files using explicit `USE database_name;` statements
+   - Each file targets specific databases and is NOT looped per tenant
+
+**Key Difference:**
+- **tenant-database**: Scripts loop through all tenants (e.g., creates `agencyos_demo`, `agencyos_livingwater`)
+- **tenant_data_scripts**: Scripts run once, each file uses `USE` to target specific databases
+
 **Execution Order:**
-1. **create_db**: Single SQL file for database creation (runs first)
-2. **tables_path**: Directory of table creation scripts (sorted alphabetically)
-3. **procedures_path**: Directory of stored procedure scripts (sorted alphabetically)
-4. **seeds_path**: Directory of seed data scripts (sorted alphabetically)
+1. **Main Database Scripts** (if configured):
+   - `setup_path` - Database setup scripts
+   - `tables_path` - Table creation scripts
+   - `procedures_path` - Stored procedure scripts
+   - `data_path` - Data scripts
+   - `seeds_path` - Seed data scripts
+
+2. **Tenant Database Scripts** (if configured, executed per tenant):
+   - `setup_path` - Tenant database setup scripts
+   - `tables_path` - Table creation scripts
+   - `procedures_path` - Stored procedure scripts
+   - `seeds_path` - Seed data scripts
+
+3. **Tenant Data Scripts** (if configured, executed once):
+   - `data_path` - SQL files with explicit `USE` statements
+
+**Example Tenant Data File:**
+```sql
+-- Insert into main database
+USE agencyos;
+INSERT INTO tenant (name, webid, ...) VALUES ('Demo', 'demo', ...);
+
+-- Insert into specific tenant database
+USE agencyos_demo;
+INSERT INTO website_css (name, is_active, ...) VALUES ('default', 1, ...);
+
+-- Insert into another tenant database
+USE agencyos_livingwater;
+INSERT INTO website_css (name, is_active, ...) VALUES ('default', 1, ...);
+```
 
 **Key Points:**
 - Database deployment is **optional** - set `enabled: false` or omit the section entirely
@@ -280,183 +374,7 @@ The ai-deploy agent supports optional database deployment via SSH tunnel. Databa
 - Database deployment occurs **after** file synchronization completes
 - All script paths are optional - only provide the ones you need
 - Files in directories are executed in alphabetical order (use prefixes like `01-`, `02-` to control order)
-
-### Dynamic Table Seeding (Optional)
-
-The ai-deploy agent supports dynamic table seeding from JSON configuration files. This feature reads JSON files containing data and automatically generates INSERT statements from SQL templates embedded in table definition files.
-
-**Use Case:** Perfect for multi-tenant applications where each tenant needs initial data (tenant record, admin users, default settings) seeded from tenant-specific configuration files.
-
-**Configuration:**
-```json
-{
-  "database": {
-    "enabled": true,
-    "ssh_host": "192.168.1.4",
-    "ssh_username": "deploy",
-    "ssh_password": "password",
-    "admin_username": "root",
-    "admin_password": "mysql_password",
-    "main_database_scripts": {
-      "db_name": "myapp_db",
-      "db_username": "myapp_user",
-      "db_password": "dbpassword",
-      "tables_path": "C:\\db\\tables"
-    },
-    "seed_tables": {
-      "enabled": true,
-      "config_files_path": "C:\\git\\myapp\\config\\tenants",
-      "config_files_extension": ".json",
-      "tables": [
-        {
-          "table_name": "tenant",
-          "table_script_file": "C:\\git\\myapp\\database\\tables\\tenant.sql",
-          "begin_mark": "BEGIN AI-AGENT.AI-DEPLOY:",
-          "end_mark": "END AI-AGENT.AI-DEPLOY:",
-          "check_exists_query": "SELECT COUNT(1) FROM tenant",
-          "variables": [
-            {"sql_var": "{{NAME}}", "json_field": "name"},
-            {"sql_var": "{{WEBID}}", "json_field": "webid"},
-            {"sql_var": "{{EMAIL}}", "json_field": "email"},
-            {"sql_var": "{{EMPLOYEE_TERM}}", "json_field": "terminology.employee"}
-          ]
-        },
-        {
-          "table_name": "user",
-          "table_script_file": "C:\\git\\myapp\\database\\tables\\user.sql",
-          "begin_mark": "BEGIN AI-AGENT.AI-DEPLOY:",
-          "end_mark": "END AI-AGENT.AI-DEPLOY:",
-          "array_field": "users",
-          "check_exists_query": "SELECT COUNT(1) FROM user",
-          "variables": [
-            {"sql_var": "{{WEBID}}", "json_field": "webid", "from_parent": true},
-            {"sql_var": "{{USERNAME}}", "json_field": "username"},
-            {"sql_var": "{{PASSWORD_HASH}}", "json_field": "password"},
-            {"sql_var": "{{ROLE}}", "json_field": "role"},
-            {"sql_var": "{{EMAIL}}", "json_field": "email"}
-          ]
-        },
-        {
-          "table_name": "tenant_module",
-          "database": "tenant",
-          "table_script_file": "C:\\git\\myapp\\database\\tenant\\tables\\tenant_module.sql",
-          "begin_mark": "BEGIN AI-AGENT.AI-DEPLOY:",
-          "end_mark": "END AI-AGENT.AI-DEPLOY:",
-          "array_field": "modules",
-          "check_exists_query": "SELECT COUNT(1) FROM tenant_module WHERE module_code = '{{MODULE_CODE}}'",
-          "variables": [
-            {"sql_var": "{{MODULE_CODE}}", "json_field": "module_code"},
-            {"sql_var": "{{MODULE_NAME}}", "json_field": "module_name"},
-            {"sql_var": "{{IS_ACTIVE}}", "json_field": "is_active"}
-          ]
-        }
-      ]
-    }
-  }
-}
-```
-
-**How It Works:**
-
-1. **JSON Config Files**: All `.json` files in `config_files_path` are processed (e.g., tenant configurations)
-2. **SQL Templates**: Table SQL files contain INSERT statement templates between comment markers:
-   ```sql
-   /*
-   BEGIN AI-AGENT.AI-DEPLOY:
-   INSERT INTO tenant (name, webid, email) VALUES ('{{NAME}}', '{{WEBID}}', '{{EMAIL}}');
-   END AI-AGENT.AI-DEPLOY:
-   */
-   ```
-   **Important**: String variables must be wrapped in quotes in the template (e.g., `'{{NAME}}'`). Numeric variables should not have quotes (e.g., `{{ID}}`).
-3. **Variable Replacement**: Variables like `{{NAME}}` are replaced with JSON values (quotes are already in template)
-4. **Array Processing**: If `array_field` is specified, creates one INSERT per array element
-5. **Conditional Seeding**: `check_exists_query` determines if seeding should be skipped
-
-**Key Features:**
-
-- **Automatic Password Hashing**: Variables containing "PASSWORD" are hashed with bcrypt using PHP's `PASSWORD_DEFAULT` format (`$2y$10$...`), fully compatible with PHP's `password_verify()`
-- **Nested JSON Access**: Use dot notation (e.g., `"terminology.employee"`) for nested fields
-- **Parent Context**: Use `"from_parent": true` to access parent JSON object from array elements
-- **NULL Handling**: Missing JSON fields are replaced with SQL NULL (even if template has quotes like `'{{VAR}}'`, result is `NULL` not `'NULL'`)
-- **Skip Existing Records**: Records are skipped if they already exist based on `check_exists_query` with variable replacement (e.g., `SELECT COUNT(1) FROM tenant WHERE webid = '{{WEBID}}'`)
-- **Array Tables**: For tables with `array_field`, `check_exists_query` is ignored (each array element is always inserted - use database unique constraints to prevent duplicates)
-
-**Execution Order:**
-```
-setup → tables → procedures → seeds → seed_tables
-```
-
-**Example JSON Config File** (`tenants/livingwater.json`):
-```json
-{
-  "name": "Living Water Therapy",
-  "webid": "livingwater",
-  "email": "admin@livingwater.org",
-  "terminology": {
-    "employee": "Clinician",
-    "customer": "Client"
-  },
-  "users": [
-    {
-      "username": "admin",
-      "password": "temp123",
-      "role": "admin",
-      "email": "admin@livingwater.org"
-    },
-    {
-      "username": "therapist1",
-      "password": "temp123",
-      "role": "clinician",
-      "email": "therapist@livingwater.org"
-    }
-  ]
-}
-```
-
-**Example Table SQL File** (`database/tables/user.sql`):
-```sql
-CREATE TABLE IF NOT EXISTS user (
-    id INT AUTO_INCREMENT PRIMARY KEY,
-    tenant_id INT NOT NULL,
-    username VARCHAR(100) NOT NULL,
-    password_hash VARCHAR(255) NOT NULL,
-    role VARCHAR(20) NOT NULL,
-    email VARCHAR(100) NOT NULL
-);
-
-/*
-BEGIN AI-AGENT.AI-DEPLOY:
-INSERT INTO user (
-    tenant_id,
-    username,
-    password_hash,
-    role,
-    email
-) VALUES (
-    (SELECT id FROM tenant WHERE webid = '{{WEBID}}'),
-    '{{USERNAME}}',
-    '{{PASSWORD_HASH}}',
-    '{{ROLE}}',
-    '{{EMAIL}}'
-);
-END AI-AGENT.AI-DEPLOY:
-*/
-```
-
-**Key Points:**
-- Dynamic table seeding is **optional** - omit `seed_tables` section if not needed
-- Processes ALL JSON files in `config_files_path` directory
-- Tables are seeded in the order defined in `tables` array
-- Passwords are automatically hashed before insertion using bcrypt with cost factor 10
-- **PHP Compatible**: Hashes use `$2y$10$...` format, identical to PHP's `password_hash($password, PASSWORD_DEFAULT)`
-- **PHP Verification**: Hashes can be verified in PHP using `password_verify($password, $hash)`
-- **Database Target**: Each table definition can specify `"database": "main"` or `"database": "tenant"` to control which database(s) to seed
-  - Tables without the `database` field default to `"main"`
-  - Tables with `"database": "main"` are seeded only on the main database
-  - Tables with `"database": "tenant"` are seeded on ALL tenant databases
-- Dry-run mode shows summary without executing INSERTs
-- Skips tables that already contain data
-- Ideal for multi-tenant initial data seeding in both main and tenant databases
+- Multi-tenant apps: Use `tenant-database` for per-tenant scripts and `tenant_data_scripts` for one-time data files
 
 ## Testing Configuration Changes
 

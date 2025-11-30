@@ -254,6 +254,9 @@ The `ignore` object specifies patterns for files and folders to skip during sync
 | `dry_run` | boolean | No | false | If true, shows what would be done without making changes |
 | `delete_extra_files` | boolean | No | true | If true, deletes files from destination that don't exist in source |
 | `verbose` | boolean | No | true | If true, shows detailed progress messages. If false, only shows essential actions (files copied/updated/deleted, SQL files executed) |
+| `ignore_cache` | boolean | No | false | If true, ignores deployment cache and performs full comparison. If false, uses cache to skip unchanged files for faster incremental deployments |
+| `clean_install` | boolean | No | false | If true, deletes all destination files and databases before deployment. Forces full re-deployment ignoring cache. Requires user confirmation. |
+| `max_concurrent_transfers` | integer | No | 20 | Maximum number of parallel file transfers (only applies when using SSH connections) |
 
 **Examples:**
 
@@ -267,12 +270,35 @@ Test mode (no changes):
 }
 ```
 
-Production mode (full sync):
+Production mode (incremental deployment with cache):
 ```json
 {
   "options": {
     "dry_run": false,
-    "delete_extra_files": true
+    "delete_extra_files": true,
+    "ignore_cache": false
+  }
+}
+```
+
+Force full deployment (ignore cache):
+```json
+{
+  "options": {
+    "dry_run": false,
+    "delete_extra_files": true,
+    "ignore_cache": true
+  }
+}
+```
+
+Clean install (delete everything and redeploy):
+```json
+{
+  "options": {
+    "dry_run": false,
+    "delete_extra_files": true,
+    "clean_install": true
   }
 }
 ```
@@ -297,6 +323,59 @@ Quiet mode (minimal output):
   }
 }
 ```
+
+Fast incremental deployment (uses cache, skips destination listing):
+```json
+{
+  "options": {
+    "dry_run": false,
+    "delete_extra_files": false,
+    "ignore_cache": false,
+    "clean_install": false,
+    "verbose": false
+  }
+}
+```
+
+### Incremental Deployment and Cache System
+
+The ai-deploy agent uses a cache system to track deployed files and database scripts for faster incremental deployments.
+
+**How it works:**
+
+1. **Cache File**: After each deployment, a cache file is created in the same directory as your config file (e.g., `.deploy_cache_ai-deploy-example-windows.json`)
+
+2. **File Tracking**: The cache stores:
+   - File modification times (mtime) and sizes
+   - Last deployment timestamp
+   - Database script execution timestamps
+   - File mapping metadata
+   - Web tenant metadata
+
+3. **Incremental Deployment** (`clean_install=false`, `ignore_cache=false`):
+   - **Skips destination file listing** - Uses cache instead of listing all destination files (much faster!)
+   - **Only deploys changed files** - Compares source files against cache to detect changes
+   - **Only executes changed SQL scripts** - Database scripts modified since last deployment are executed
+   - **Trusts the cache** - Assumes destination is in sync with cache (no accidental deletions)
+
+4. **Full Deployment** (`ignore_cache=true` or `clean_install=true`):
+   - Lists all destination files
+   - Compares all files (ignores cache)
+   - Executes all database scripts
+   - Updates cache after deployment
+
+**Performance Benefits:**
+
+- **Faster file comparison**: Skips slow destination file listing (especially over SSH)
+- **Faster database deployment**: Only executes changed SQL scripts
+- **Faster file sync**: Only copies new/modified files based on cache
+
+**Important Notes:**
+
+- Cache is safe to delete - next deployment will perform full comparison
+- Always use `clean_install=true` for first deployment to new destination
+- Use `ignore_cache=true` if you suspect cache is out of sync
+- Cache file should be excluded from version control (add to `.gitignore`)
 
 ## Database Configuration
 

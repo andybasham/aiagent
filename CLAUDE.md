@@ -56,13 +56,28 @@ The framework uses a three-layer architecture that separates concerns:
 
 **Configuration-Driven**: All agents are configured via JSON. The base class loads the config and calls abstract `_validate_config()` before execution. Agents use `_create_handler()` pattern to instantiate appropriate handlers based on config `type` field.
 
-**File Comparison Algorithm** (ai-deploy): The agent doesn't stream or transfer immediately. Instead, it:
-1. Lists all files from both source and destination
-2. Filters source files through ignore patterns
-3. Categorizes files into new/modified/deleted by comparing metadata (size, mtime)
-4. Executes synchronization in three phases: copy new, update modified, delete extra
+**File Comparison Algorithm** (ai-deploy): The agent supports both full and incremental deployments:
+1. **Full Deployment** (`clean_install=true` or `ignore_cache=true`):
+   - Lists all files from both source and destination
+   - Filters source files through ignore patterns
+   - Categorizes files into new/modified/deleted by comparing metadata (size, mtime)
+   - Executes synchronization in three phases: copy new, update modified, delete extra
+2. **Incremental Deployment** (`clean_install=false`, default):
+   - **Skips destination file listing** for much faster deployment (especially over SSH)
+   - Uses deployment cache to track previously deployed files
+   - Only copies files that have changed since last deployment
+   - Only executes database scripts modified since last deployment
+   - Cache file is created in same directory as config file (e.g., `.deploy_cache_config-name.json`)
 
 **Ignore Pattern System**: Three-tier filtering (files, folders, extensions) using `fnmatch` for wildcards. Patterns are checked in `_should_ignore()` method before including files in sync operations.
+
+**Cache System**: The agent maintains a deployment cache (`.deploy_cache_*.json`) that tracks:
+- File metadata (mtime, size) for each deployed file
+- Last deployment timestamp
+- Database script execution timestamps
+- File mapping metadata
+- Web tenant metadata
+This enables fast incremental deployments by skipping unchanged files and database scripts. When `clean_install=false` and cache exists, the agent skips the slow destination file listing step entirely and trusts the cache.
 
 ## Creating New Agents
 

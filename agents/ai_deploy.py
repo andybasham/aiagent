@@ -548,13 +548,17 @@ class AiDeployAgent(AgentBase):
 
         Args:
             source_files: List of source file information
-            dest_files: List of destination file information
+            dest_files: List of destination file information (empty if using cache-only mode)
 
         Returns:
             Tuple of (new_files, modified_files, deleted_files)
         """
         ignore_cache = self.config.get('options', {}).get('ignore_cache', False)
+        clean_install = self.config.get('options', {}).get('clean_install', False)
         cached_files = self.cache_data.get('files', {})
+
+        # Check if we're in cache-only mode (dest_files is empty and we have cache)
+        using_cache_only = len(dest_files) == 0 and len(cached_files) > 0 and not clean_install and not ignore_cache
 
         # Normalize all paths to use forward slashes for comparison
         # Create dictionaries for quick lookup
@@ -568,11 +572,23 @@ class AiDeployAgent(AgentBase):
                 source_dict[normalized_path] = f_copy
 
         dest_dict = {}
-        for f in dest_files:
-            normalized_path = self._normalize_path(f['path'])
-            f_copy = f.copy()
-            f_copy['path'] = normalized_path
-            dest_dict[normalized_path] = f_copy
+        if using_cache_only:
+            # Use cache as destination - create synthetic file entries from cache
+            for cached_path, cached_info in cached_files.items():
+                if not self._should_ignore(cached_path):
+                    dest_dict[cached_path] = {
+                        'path': cached_path,
+                        'size': cached_info.get('size', 0),
+                        'modified_time': cached_info.get('mtime', 0),
+                        'is_directory': False
+                    }
+        else:
+            # Use actual destination files
+            for f in dest_files:
+                normalized_path = self._normalize_path(f['path'])
+                f_copy = f.copy()
+                f_copy['path'] = normalized_path
+                dest_dict[normalized_path] = f_copy
 
         new_files = []
         modified_files = []
@@ -584,7 +600,7 @@ class AiDeployAgent(AgentBase):
                 # New file
                 new_files.append(source_file)
             else:
-                # File exists on destination
+                # File exists on destination (or in cache)
                 # Check cache first if enabled
                 if not ignore_cache and path in cached_files:
                     cached_info = cached_files[path]
@@ -609,15 +625,18 @@ class AiDeployAgent(AgentBase):
             file_mapping_dests.add(dest_path)
 
         # Find deleted files
-        for path in dest_dict:
-            if path not in source_dict:
-                # File exists in destination but not in source (and not ignored)
-                # Skip if this file is created by file mappings
-                if path in file_mapping_dests:
-                    continue
-                # Only mark for deletion if it's not being ignored
-                if not self._should_ignore(path):
-                    deleted_files.append(path)
+        # When using cache-only mode, we trust the cache and don't delete files
+        # (avoids accidentally deleting files that exist on destination but not in cache)
+        if not using_cache_only:
+            for path in dest_dict:
+                if path not in source_dict:
+                    # File exists in destination but not in source (and not ignored)
+                    # Skip if this file is created by file mappings
+                    if path in file_mapping_dests:
+                        continue
+                    # Only mark for deletion if it's not being ignored
+                    if not self._should_ignore(path):
+                        deleted_files.append(path)
 
         return new_files, modified_files, deleted_files
 
@@ -678,21 +697,33 @@ class AiDeployAgent(AgentBase):
             deleted_files: List of files to delete from destination
         """
         dry_run = self.config.get('options', {}).get('dry_run', False)
+        clean_install = self.config.get('options', {}).get('clean_install', False)
         max_workers = self.config.get('options', {}).get('max_concurrent_transfers', 20)
 
         # Check if source or destination uses SSH
         is_source_ssh = self.config.get('source', {}).get('type') == 'ssh'
         is_dest_ssh = self.config.get('destination', {}).get('type') == 'ssh'
 
+        # Calculate total file changes
+        total_file_changes = len(new_files) + len(modified_files) + len(deleted_files)
+
+        # Skip connection pools if clean_install=false and total changes < 10
+        # For small deployments, the overhead of creating pools isn't worth it
+        skip_pools = not clean_install and total_file_changes < 10
+        use_parallel = not skip_pools and max_workers > 1
+
+        if skip_pools and self.verbose:
+            self.logger.info(f"Using single connection for small deployment ({total_file_changes} file changes)")
+
         # Initialize connection pools for SSH (one pool per SSH endpoint)
-        if is_source_ssh and max_workers > 1:
+        if is_source_ssh and use_parallel:
             pool_size = max_workers  # Match pool size to max workers to avoid timeouts
             self.source_pool = SSHConnectionPool(self.config['source'], pool_size)
             self.source_pool.initialize()
             if self.verbose:
                 self.logger.info(f"Created SSH connection pool for source ({pool_size} connections)")
 
-        if is_dest_ssh and max_workers > 1:
+        if is_dest_ssh and use_parallel:
             pool_size = max_workers  # Match pool size to max workers to avoid timeouts
             # Merge destination config with website path
             website_config = self.config.get('website', {})
@@ -704,13 +735,16 @@ class AiDeployAgent(AgentBase):
             if self.verbose:
                 self.logger.info(f"Created SSH connection pool for destination ({pool_size} connections)")
 
-        if (is_source_ssh or is_dest_ssh) and max_workers > 1:
+        if (is_source_ssh or is_dest_ssh) and use_parallel:
             self.logger.info(f"Using {max_workers} parallel file transfers with connection pooling")
+
+        # Adjust max_workers based on whether we're using pools
+        actual_max_workers = max_workers if use_parallel else 1
 
         # Copy new files in parallel
         if new_files:
             self.logger.info(f"New files to copy: {len(new_files)}")
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            with ThreadPoolExecutor(max_workers=actual_max_workers) as executor:
                 futures = {
                     executor.submit(self._transfer_file_worker, file_info, 'copy', dry_run): file_info
                     for file_info in new_files
@@ -728,7 +762,7 @@ class AiDeployAgent(AgentBase):
         # Update modified files in parallel
         if modified_files:
             self.logger.info(f"Modified files to update: {len(modified_files)}")
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            with ThreadPoolExecutor(max_workers=actual_max_workers) as executor:
                 futures = {
                     executor.submit(self._transfer_file_worker, file_info, 'update', dry_run): file_info
                     for file_info in modified_files
@@ -747,7 +781,7 @@ class AiDeployAgent(AgentBase):
         delete_enabled = self.config.get('options', {}).get('delete_extra_files', True)
         if delete_enabled and deleted_files:
             self.logger.info(f"Files to delete from destination: {len(deleted_files)}")
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            with ThreadPoolExecutor(max_workers=actual_max_workers) as executor:
                 # Convert strings to dict format for consistency
                 file_dicts = [{'path': path} for path in deleted_files]
                 futures = {
@@ -952,7 +986,7 @@ class AiDeployAgent(AgentBase):
             db_cache = self.cache_data.get('database', {})
             last_deployment_timestamp = db_cache.get('last_deployment_timestamp')
 
-            if ignore_cache:
+            if ignore_cache or clean_install:
                 last_deployment_timestamp = None
 
             # Skip database deployment if clean_install is false and no files have changed
@@ -1198,15 +1232,26 @@ class AiDeployAgent(AgentBase):
         except Exception as e:
             self.logger.error(f"Error during database cleanup: {e}")
 
-    def _execute_permissions_script(self) -> None:
-        """Execute permissions script on destination server (SSH only)."""
+    def _execute_permissions_script(self, files_changed: bool = False) -> None:
+        """
+        Execute permissions script on destination server (SSH only).
+
+        Args:
+            files_changed: True if any files were copied/modified/deleted
+        """
         website_config = self.config.get('website', {})
         script_path = website_config.get('set_permissions_script')
 
         if not script_path:
             return
 
-        # Skip if no changes were made (optimization)
+        # Skip if no file changes were made (optimization)
+        # Permissions script does find/chmod on all files - unnecessary if no files changed
+        if not files_changed:
+            self.logger.info("No file changes deployed, skipping permissions script")
+            return
+
+        # Also skip if no overall changes (shouldn't happen, but double-check)
         if not self.deployment_made_changes:
             self.logger.info("No changes deployed, skipping permissions script")
             return
@@ -1518,18 +1563,29 @@ class AiDeployAgent(AgentBase):
                 # Reset cache since we're starting fresh
                 self.cache_data = self._create_empty_cache()
 
-            # List files
+            # List source files (always needed)
             if self.verbose:
                 self.logger.info("Listing source files...")
             source_files = self.source_handler.list_files(recursive=True)
             if self.verbose:
                 self.logger.info(f"Found {len(source_files)} files in source")
 
-            if self.verbose:
-                self.logger.info("Listing destination files...")
-            dest_files = self.dest_handler.list_files(recursive=True)
-            if self.verbose:
-                self.logger.info(f"Found {len(dest_files)} files in destination")
+            # Determine if we need to list destination files
+            # Skip destination listing if we have cache and clean_install=false
+            has_cache = bool(self.cache_data.get('files')) and bool(self.cache_data.get('last_deployment'))
+            skip_dest_listing = has_cache and not clean_install and not ignore_cache
+
+            if skip_dest_listing:
+                if self.verbose:
+                    self.logger.info("Skipping destination file listing (using cache for incremental deployment)")
+                # Use empty destination list - cache will handle comparison
+                dest_files = []
+            else:
+                if self.verbose:
+                    self.logger.info("Listing destination files...")
+                dest_files = self.dest_handler.list_files(recursive=True)
+                if self.verbose:
+                    self.logger.info(f"Found {len(dest_files)} files in destination")
 
             # Compare files
             if self.verbose:
@@ -1596,7 +1652,9 @@ class AiDeployAgent(AgentBase):
                 self._process_file_mappings()
 
             # Execute permissions script if configured
-            self._execute_permissions_script()
+            # Only run if files were actually changed (new, modified, or deleted)
+            files_changed = len(new_files) > 0 or len(modified_files) > 0 or len(deleted_files) > 0
+            self._execute_permissions_script(files_changed=files_changed)
 
         except Exception as e:
             self.logger.error(f"Error during deployment: {e}")

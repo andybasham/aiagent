@@ -412,7 +412,6 @@ The `database` object enables database deployment and seeding functionality via 
 | `tables_path` | string | No | Path to table creation scripts |
 | `procedures_path` | string | No | Path to stored procedure scripts |
 | `data_path` | string | No | Path to data SQL scripts (runs after procedures) |
-| `seeds_path` | string | No | Path to seed data scripts |
 
 ### Tenant Database Scripts Object
 
@@ -427,7 +426,7 @@ The `tenant-database` object defines scripts that are executed **for each tenant
 | `setup_path` | string | No | Path to setup SQL scripts directory (executed per tenant) |
 | `tables_path` | string | No | Path to table creation scripts (executed per tenant) |
 | `procedures_path` | string | No | Path to stored procedure scripts (executed per tenant) |
-| `seeds_path` | string | No | Path to seed data scripts (executed per tenant) |
+| `data_path` | string | No | Path to data SQL scripts (executed per tenant) |
 
 **Note**: Scripts in these paths are executed once **per tenant**. Each tenant's database is created using template variables like `{{WEBID}}`.
 
@@ -479,8 +478,7 @@ INSERT INTO website_css (name, is_active, ...) VALUES ('default', 1, ...);
       "setup_path": "C:\\db\\setup",
       "tables_path": "C:\\db\\tables",
       "procedures_path": "C:\\db\\procedures",
-      "data_path": "C:\\db\\data",
-      "seeds_path": "C:\\db\\seeds"
+      "data_path": "C:\\db\\data"
     }
   }
 }
@@ -529,13 +527,12 @@ INSERT INTO website_css (name, is_active, ...) VALUES ('default', 1, ...);
    - `tables_path` - Table creation scripts
    - `procedures_path` - Stored procedure scripts
    - `data_path` - Data scripts (runs after procedures)
-   - `seeds_path` - Seed data scripts
 
 2. **Tenant Database Scripts** (if configured, executed per tenant):
    - `setup_path` - Database setup scripts (create tenant database, users, grants)
    - `tables_path` - Table creation scripts
    - `procedures_path` - Stored procedure scripts
-   - `seeds_path` - Seed data scripts
+   - `data_path` - Data scripts
 
 3. **Tenant Data Scripts** (if configured, executed once after all tenant databases are created):
    - `data_path` - SQL files using explicit `USE` statements to insert data into specific databases

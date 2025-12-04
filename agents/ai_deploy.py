@@ -301,7 +301,7 @@ class AiDeployAgent(AgentBase):
                 scripts.get('setup_path'),
                 scripts.get('tables_path'),
                 scripts.get('procedures_path'),
-                scripts.get('seeds_path')
+                scripts.get('data_path')
             ]):
                 raise ValueError("main_database_scripts must have at least one script path")
 
@@ -446,8 +446,6 @@ class AiDeployAgent(AgentBase):
                 db_config['procedures_path'] = tenant_db_config['procedures_path']
             if 'data_path' in tenant_db_config:
                 db_config['data_path'] = tenant_db_config['data_path']
-            if 'seeds_path' in tenant_db_config:
-                db_config['seeds_path'] = tenant_db_config['seeds_path']
 
             tenant_database_configs.append(db_config)
 
@@ -909,7 +907,7 @@ class AiDeployAgent(AgentBase):
             main_database_scripts = database_config.get('main_database_scripts')
             if main_database_scripts:
                 # Check all script directories
-                for script_type in ['setup_path', 'tables_path', 'procedures_path', 'data_path', 'seeds_path']:
+                for script_type in ['setup_path', 'tables_path', 'procedures_path', 'data_path']:
                     script_path = main_database_scripts.get(script_type)
                     if script_path and os.path.exists(script_path):
                         if os.path.isfile(script_path):
@@ -931,7 +929,7 @@ class AiDeployAgent(AgentBase):
             tenant_database_scripts = self._build_tenant_database_configs()
             if tenant_database_scripts:
                 for tenant_config in tenant_database_scripts:
-                    for script_type in ['setup_path', 'tables_path', 'procedures_path', 'seeds_path']:
+                    for script_type in ['setup_path', 'tables_path', 'procedures_path', 'data_path']:
                         script_path = tenant_config.get(script_type)
                         if script_path and os.path.exists(script_path):
                             if os.path.isfile(script_path):

@@ -935,21 +935,6 @@ class DatabaseHandler:
                 if files_executed > 0:
                     any_scripts_executed = True
 
-            # 4. Execute tenant seed scripts
-            if tenant_config.get('seeds_path'):
-                self.logger.info("=" * 60)
-                self.logger.warning(f"STEP 4: Seeding data for tenant '{tenant_name}'")
-                self.logger.info("=" * 60)
-                dir_success, files_executed = self.execute_sql_directory(
-                    tenant_config['seeds_path'], dry_run, use_database=True,
-                    template_vars=tenant_template_vars, database_name=tenant_name,
-                    last_deployment_timestamp=last_deployment_timestamp
-                )
-                if not dir_success:
-                    success = False
-                if files_executed > 0:
-                    any_scripts_executed = True
-
             return (success, any_scripts_executed, tenant_name)
 
         except Exception as e:
@@ -974,8 +959,8 @@ class DatabaseHandler:
         Args:
             admin_username: Admin username for template variables
             admin_password: Admin password for template variables
-            main_database_scripts: Dictionary with db_name, db_username, db_password, setup_path, tables_path, procedures_path, seeds_path
-            tenant_database_scripts: List of dictionaries, each with db_name, db_username, db_password, setup_path, tables_path, procedures_path, seeds_path
+            main_database_scripts: Dictionary with db_name, db_username, db_password, setup_path, tables_path, procedures_path, data_path
+            tenant_database_scripts: List of dictionaries, each with db_name, db_username, db_password, setup_path, tables_path, procedures_path, data_path
             tenant_data_scripts: Dictionary with enabled, data_path - executed ONCE for all tenants (files use explicit USE statements)
             dry_run: If True, only show what would be executed
             last_deployment_timestamp: Unix timestamp of last deployment, skip SQL files older than this
@@ -1059,17 +1044,6 @@ class DatabaseHandler:
                     self.logger.warning("STEP 4: Loading main database data")
                     self.logger.info("=" * 60)
                     dir_success, files_executed = self.execute_sql_directory(main_database_scripts['data_path'], dry_run, template_vars=main_template_vars, last_deployment_timestamp=last_deployment_timestamp)
-                    if not dir_success:
-                        success = False
-                    if files_executed > 0:
-                        any_scripts_executed = True
-
-                # 5. Execute main seed scripts
-                if main_database_scripts.get('seeds_path'):
-                    self.logger.info("=" * 60)
-                    self.logger.warning("STEP 5: Seeding main database data")
-                    self.logger.info("=" * 60)
-                    dir_success, files_executed = self.execute_sql_directory(main_database_scripts['seeds_path'], dry_run, template_vars=main_template_vars, last_deployment_timestamp=last_deployment_timestamp)
                     if not dir_success:
                         success = False
                     if files_executed > 0:

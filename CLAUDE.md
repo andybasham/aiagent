@@ -277,8 +277,7 @@ The ai-deploy agent supports optional database deployment via SSH tunnel. Databa
       "setup_path": "C:\\path\\to\\setup",
       "tables_path": "C:\\path\\to\\tables",
       "procedures_path": "C:\\path\\to\\procs",
-      "data_path": "C:\\path\\to\\data",
-      "seeds_path": "C:\\path\\to\\seeds"
+      "data_path": "C:\\path\\to\\data"
     }
   }
 }
@@ -332,14 +331,13 @@ The ai-deploy agent supports optional database deployment via SSH tunnel. Databa
    - `tables_path`: Table creation scripts
    - `procedures_path`: Stored procedure scripts
    - `data_path`: Data scripts
-   - `seeds_path`: Seed data scripts
 
 2. **tenant-database**: Scripts executed **per tenant** (uses {{WEBID}} template variable)
    - `db_name`: Tenant database name pattern (e.g., `agencyos_{{WEBID}}`)
    - `setup_path`: Tenant database setup scripts (executed per tenant)
    - `tables_path`: Table creation scripts (executed per tenant)
    - `procedures_path`: Stored procedure scripts (executed per tenant)
-   - `seeds_path`: Seed data scripts (executed per tenant)
+   - `data_path`: Data scripts (executed per tenant)
 
 3. **tenant_data_scripts**: Scripts executed **once** after all tenant databases are created
    - `data_path`: SQL files using explicit `USE database_name;` statements
@@ -355,13 +353,12 @@ The ai-deploy agent supports optional database deployment via SSH tunnel. Databa
    - `tables_path` - Table creation scripts
    - `procedures_path` - Stored procedure scripts
    - `data_path` - Data scripts
-   - `seeds_path` - Seed data scripts
 
 2. **Tenant Database Scripts** (if configured, executed per tenant):
    - `setup_path` - Tenant database setup scripts
    - `tables_path` - Table creation scripts
    - `procedures_path` - Stored procedure scripts
-   - `seeds_path` - Seed data scripts
+   - `data_path` - Data scripts
 
 3. **Tenant Data Scripts** (if configured, executed once):
    - `data_path` - SQL files with explicit `USE` statements

@@ -159,20 +159,6 @@ class AiDeployAgent(AgentBase):
         if 'database' in config:
             self._validate_database_config(config['database'])
 
-        # Validate warn option if present (support both boolean and dict formats)
-        if 'warn' in config:
-            warn_config = config['warn']
-            # Support both "warn": true and "warn": {"enabled": true}
-            if isinstance(warn_config, bool):
-                # Convert boolean to dict format internally
-                config['warn'] = {'enabled': warn_config}
-            elif isinstance(warn_config, dict):
-                if 'enabled' not in warn_config:
-                    raise ValueError("warn.enabled is required")
-                if not isinstance(warn_config['enabled'], bool):
-                    raise ValueError("warn.enabled must be a boolean")
-            else:
-                raise ValueError("warn must be a boolean or dictionary")
 
         # Validate options if present
         if 'options' in config:
@@ -188,10 +174,10 @@ class AiDeployAgent(AgentBase):
             if 'clean_install' in options and not isinstance(options['clean_install'], bool):
                 raise ValueError("options.clean_install must be a boolean")
 
-            # Validate warn (deprecated location, moved to root level)
+            # Validate warn option
             if 'warn' in options:
                 if not isinstance(options['warn'], bool):
-                    raise ValueError("options.warn must be a boolean (deprecated - use root level 'warn' instead)")
+                    raise ValueError("options.warn must be a boolean")
 
             # Validate max_concurrent_transfers
             if 'max_concurrent_transfers' in options:
@@ -1705,9 +1691,9 @@ class AiDeployAgent(AgentBase):
         Returns:
             True if deployment should proceed, False if cancelled
         """
-        warn_config = self.config.get('warn', {})
+        warn_enabled = self.config.get('options', {}).get('warn', False)
 
-        if not warn_config.get('enabled', False):
+        if not warn_enabled:
             return True
 
         # Use description from config

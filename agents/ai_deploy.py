@@ -266,6 +266,27 @@ class AiDeployAgent(AgentBase):
             if not isinstance(website['set_permissions_script'], str):
                 raise ValueError("website.set_permissions_script must be a string path")
 
+        # Validate cronjobs config if present
+        if 'cronjobs' in website:
+            cronjobs_config = website['cronjobs']
+            if not isinstance(cronjobs_config, dict):
+                raise ValueError("website.cronjobs must be a dictionary")
+            if 'script' in cronjobs_config:
+                if not isinstance(cronjobs_config['script'], str):
+                    raise ValueError("website.cronjobs.script must be a string path")
+            if 'server_path' in cronjobs_config:
+                if not isinstance(cronjobs_config['server_path'], str):
+                    raise ValueError("website.cronjobs.server_path must be a string path")
+            if 'local_path' in cronjobs_config:
+                if not isinstance(cronjobs_config['local_path'], str):
+                    raise ValueError("website.cronjobs.local_path must be a string path")
+            if 'create_table_file' in cronjobs_config:
+                if not isinstance(cronjobs_config['create_table_file'], str):
+                    raise ValueError("website.cronjobs.create_table_file must be a string path")
+            if 'insert_data_file' in cronjobs_config:
+                if not isinstance(cronjobs_config['insert_data_file'], str):
+                    raise ValueError("website.cronjobs.insert_data_file must be a string path")
+
         # Validate ignore if present
         if 'ignore' in website:
             ignore_config = website['ignore']
@@ -1348,6 +1369,244 @@ class AiDeployAgent(AgentBase):
         except Exception as e:
             self.logger.error(f"Error executing permissions script: {e}")
 
+    def _cronjobs_files_changed(self) -> bool:
+        """
+        Check if cronjobs script, files in local_path, or SQL files have changed since last deployment.
+
+        Returns:
+            True if any cronjobs files have changed, False otherwise
+        """
+        website_config = self.config.get('website', {})
+        cronjobs_config = website_config.get('cronjobs', {})
+        source_path = self.config.get('source', {}).get('path', '')
+
+        script_name = cronjobs_config.get('script')
+        local_path = cronjobs_config.get('local_path', '')
+        create_table_file = cronjobs_config.get('create_table_file', '')
+        insert_data_file = cronjobs_config.get('insert_data_file', '')
+
+        # Get cached cronjobs data
+        cronjobs_cache = self.cache_data.get('cronjobs', {})
+        cached_script_mtime = cronjobs_cache.get('script_mtime', 0)
+        cached_files = cronjobs_cache.get('files', {})
+        cached_create_table_mtime = cronjobs_cache.get('create_table_mtime', 0)
+        cached_insert_data_mtime = cronjobs_cache.get('insert_data_mtime', 0)
+
+        # Check if the script file has changed
+        if script_name:
+            # Script is always relative to source root (matches execution behavior)
+            script_local_path = os.path.join(source_path, script_name)
+
+            if os.path.exists(script_local_path):
+                script_mtime = os.path.getmtime(script_local_path)
+                if script_mtime > cached_script_mtime:
+                    if self.verbose:
+                        self.logger.info(f"Cronjobs script changed: {script_name}")
+                    return True
+
+        # Check if create_table_file has changed
+        if create_table_file and os.path.exists(create_table_file):
+            create_table_mtime = os.path.getmtime(create_table_file)
+            if create_table_mtime > cached_create_table_mtime:
+                if self.verbose:
+                    self.logger.info(f"Cronjobs create_table_file changed: {os.path.basename(create_table_file)}")
+                return True
+
+        # Check if insert_data_file has changed
+        if insert_data_file and os.path.exists(insert_data_file):
+            insert_data_mtime = os.path.getmtime(insert_data_file)
+            if insert_data_mtime > cached_insert_data_mtime:
+                if self.verbose:
+                    self.logger.info(f"Cronjobs insert_data_file changed: {os.path.basename(insert_data_file)}")
+                return True
+
+        # Check if any files in the local_path have changed
+        if local_path and os.path.exists(local_path) and os.path.isdir(local_path):
+            for root, dirs, files in os.walk(local_path):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    file_mtime = os.path.getmtime(file_path)
+                    cached_mtime = cached_files.get(file_path, 0)
+
+                    if file_mtime > cached_mtime:
+                        if self.verbose:
+                            self.logger.info(f"Cronjobs file changed: {file}")
+                        return True
+
+        return False
+
+    def _update_cronjobs_cache(self) -> None:
+        """Update cache with current cronjobs file metadata."""
+        website_config = self.config.get('website', {})
+        cronjobs_config = website_config.get('cronjobs', {})
+        source_path = self.config.get('source', {}).get('path', '')
+
+        script_name = cronjobs_config.get('script')
+        local_path = cronjobs_config.get('local_path', '')
+        create_table_file = cronjobs_config.get('create_table_file', '')
+        insert_data_file = cronjobs_config.get('insert_data_file', '')
+
+        if 'cronjobs' not in self.cache_data:
+            self.cache_data['cronjobs'] = {}
+
+        cronjobs_cache = self.cache_data['cronjobs']
+
+        # Update script mtime
+        if script_name:
+            # Script is always relative to source root (matches execution behavior)
+            script_local_path = os.path.join(source_path, script_name)
+
+            if os.path.exists(script_local_path):
+                cronjobs_cache['script_mtime'] = os.path.getmtime(script_local_path)
+
+        # Update create_table_file mtime
+        if create_table_file and os.path.exists(create_table_file):
+            cronjobs_cache['create_table_mtime'] = os.path.getmtime(create_table_file)
+
+        # Update insert_data_file mtime
+        if insert_data_file and os.path.exists(insert_data_file):
+            cronjobs_cache['insert_data_mtime'] = os.path.getmtime(insert_data_file)
+
+        # Update files mtimes from local_path
+        if local_path and os.path.exists(local_path) and os.path.isdir(local_path):
+            if 'files' not in cronjobs_cache:
+                cronjobs_cache['files'] = {}
+
+            for root, dirs, files in os.walk(local_path):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    cronjobs_cache['files'][file_path] = os.path.getmtime(file_path)
+
+    def _execute_cronjobs_script(self) -> None:
+        """
+        Execute cronjobs setup script on destination server (SSH only).
+        This runs after all deployment steps including database and permissions.
+        Only executes if the script or files in the cronjobs path have changed.
+        """
+        website_config = self.config.get('website', {})
+        cronjobs_config = website_config.get('cronjobs', {})
+        script_name = cronjobs_config.get('script')
+
+        if not script_name:
+            return
+
+        # Check if destination is SSH
+        if self.config['destination']['type'] != 'ssh':
+            self.logger.warning("cronjobs.script only works with SSH destinations - skipping")
+            return
+
+        try:
+            dry_run = self.config.get('options', {}).get('dry_run', False)
+            ignore_cache = self.config.get('options', {}).get('ignore_cache', False)
+            clean_install = self.config.get('options', {}).get('clean_install', False)
+
+            # Check if cronjobs files have changed (skip check for clean_install or ignore_cache)
+            if not clean_install and not ignore_cache:
+                if not self._cronjobs_files_changed():
+                    self.logger.info("No cronjobs files changed, skipping cronjobs script")
+                    return
+
+            self.logger.info("=" * 60)
+            self.logger.info("SETTING UP CRONJOBS")
+            self.logger.info("=" * 60)
+
+            # Get SSH handler
+            if not hasattr(self.dest_handler, 'ssh_client'):
+                self.logger.error("Destination handler is not SSH - cannot execute cronjobs script")
+                return
+
+            ssh_client = self.dest_handler.ssh_client
+
+            # Build full path on destination server
+            # Script is always relative to website root
+            dest_base_path = website_config.get('path')
+            full_script_path = f"{dest_base_path}/{script_name}"
+            server_path = cronjobs_config.get('server_path', '')
+
+            if dry_run:
+                self.logger.info(f"  [DRY RUN] Would make script executable: {full_script_path}")
+                if server_path:
+                    self.logger.info(f"  [DRY RUN] Would convert line endings for files in: {server_path}")
+                self.logger.info(f"  [DRY RUN] Would execute script: {full_script_path}")
+                return
+
+            # Get SSH password for sudo
+            ssh_password = self.config['destination'].get('password', '')
+
+            # Fix line endings for all PHP files in server_path (convert Windows CRLF to Unix LF)
+            if server_path:
+                self.logger.info(f"Converting line endings for PHP files in: {server_path}")
+                dos2unix_php_cmd = f"find {server_path} -name '*.php' -exec sed -i 's/\\r$//' {{}} \\;"
+                stdin, stdout, stderr = ssh_client.exec_command(dos2unix_php_cmd)
+                stdout.channel.recv_exit_status()  # Wait for completion
+
+            # Fix line endings for the script itself
+            self.logger.info(f"Converting line endings to Unix format: {full_script_path}")
+            dos2unix_cmd = f"sed -i 's/\\r$//' {full_script_path}"
+            stdin, stdout, stderr = ssh_client.exec_command(dos2unix_cmd)
+            stdout.channel.recv_exit_status()  # Wait for completion
+
+            # Make script executable
+            self.logger.info(f"Making script executable: {full_script_path}")
+            chmod_cmd = f"echo '{ssh_password}' | sudo -S chmod +x {full_script_path}"
+            stdin, stdout, stderr = ssh_client.exec_command(chmod_cmd)
+            exit_status = stdout.channel.recv_exit_status()
+
+            # Read stderr but filter out the sudo password prompt
+            error_output = stderr.read().decode()
+            # Filter out common sudo password prompts
+            error_lines = [line for line in error_output.split('\n')
+                          if line.strip() and '[sudo]' not in line.lower()
+                          and 'password' not in line.lower()]
+
+            if exit_status != 0 and error_lines:
+                self.logger.error(f"Failed to make script executable: {chr(10).join(error_lines)}")
+                return
+
+            # Execute the script
+            self.logger.info(f"Executing cronjobs script: {full_script_path}")
+            exec_cmd = f"cd {dest_base_path} && echo '{ssh_password}' | sudo -S bash {full_script_path}"
+            stdin, stdout, stderr = ssh_client.exec_command(exec_cmd)
+
+            # Stream output in real-time (including echo messages from script)
+            for line in stdout:
+                line_text = line.rstrip()
+                if line_text:  # Only log non-empty lines
+                    self.logger.info(f"  {line_text}")
+
+            exit_status = stdout.channel.recv_exit_status()
+
+            # Read and filter stderr
+            error_output = stderr.read().decode()
+
+            if exit_status != 0:
+                self.logger.error(f"Cronjobs script failed with exit code {exit_status}")
+
+                # Filter out sudo password prompts but show actual errors
+                error_lines = [line for line in error_output.split('\n')
+                              if line.strip() and '[sudo]' not in line.lower()
+                              and 'password for' not in line.lower()]
+
+                if error_lines:
+                    self.logger.error("Error output:")
+                    for line in error_lines:
+                        self.logger.error(f"  {line}")
+                else:
+                    # If no filtered errors, show raw stderr (might have useful info)
+                    if error_output.strip():
+                        self.logger.error(f"Raw error output: {error_output}")
+            else:
+                # Update cache after successful execution
+                self._update_cronjobs_cache()
+                self.deployment_made_changes = True
+
+                self.logger.info("=" * 60)
+                self.logger.info("Cronjobs script executed successfully!")
+                self.logger.info("=" * 60)
+
+        except Exception as e:
+            self.logger.error(f"Error executing cronjobs script: {e}")
+
     def _tenant_needs_deployment(self, tenant_name: str, config_file: str, assets_path: str, generated_css_path: str = None) -> bool:
         """
         Check if a tenant needs to be deployed by comparing file modification times.
@@ -1653,6 +1912,9 @@ class AiDeployAgent(AgentBase):
             # Only run if files were actually changed (new, modified, or deleted)
             files_changed = len(new_files) > 0 or len(modified_files) > 0 or len(deleted_files) > 0
             self._execute_permissions_script(files_changed=files_changed)
+
+            # Execute cronjobs setup script if configured
+            self._execute_cronjobs_script()
 
         except Exception as e:
             self.logger.error(f"Error during deployment: {e}")

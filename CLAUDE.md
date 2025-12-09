@@ -79,6 +79,12 @@ The framework uses a three-layer architecture that separates concerns:
 - Web tenant metadata
 This enables fast incremental deployments by skipping unchanged files and database scripts. When `clean_install=false` and cache exists, the agent skips the slow destination file listing step entirely and trusts the cache.
 
+**Migration Mode** (`migration_only=true`): When enabled, only executes scripts from `migration_path` directories:
+- Skips `setup_path`, `tables_path`, `procedures_path`, `data_path` in both main and tenant database scripts
+- Skips `tenant_data_scripts` entirely
+- Cannot be used with `clean_install=true` (throws validation error)
+- Useful for running schema changes on existing databases without full re-deployment
+
 ## Creating New Agents
 
 1. Create class in `agents/` inheriting from `AgentBase`:

@@ -191,6 +191,14 @@ class AiDeployAgent(AgentBase):
             if 'verbose' in options and not isinstance(options['verbose'], bool):
                 raise ValueError("options.verbose must be a boolean")
 
+            # Validate migration_only
+            if 'migration_only' in options and not isinstance(options['migration_only'], bool):
+                raise ValueError("options.migration_only must be a boolean")
+
+            # Validate that clean_install and migration_only are not both true
+            if options.get('clean_install', False) and options.get('migration_only', False):
+                raise ValueError("options.clean_install and options.migration_only cannot both be true")
+
     def _validate_location_config(self, location: Dict[str, Any], name: str, config: Dict[str, Any]) -> None:
         """Validate source or destination configuration."""
         if 'type' not in location:
@@ -453,6 +461,8 @@ class AiDeployAgent(AgentBase):
                 db_config['procedures_path'] = tenant_db_config['procedures_path']
             if 'data_path' in tenant_db_config:
                 db_config['data_path'] = tenant_db_config['data_path']
+            if 'migration_path' in tenant_db_config:
+                db_config['migration_path'] = tenant_db_config['migration_path']
 
             tenant_database_configs.append(db_config)
 
@@ -910,11 +920,18 @@ class AiDeployAgent(AgentBase):
             True if any database files have changed, False otherwise
         """
         try:
+            migration_only = self.config.get('options', {}).get('migration_only', False)
+
             # Check main database scripts
             main_database_scripts = database_config.get('main_database_scripts')
             if main_database_scripts:
-                # Check all script directories
-                for script_type in ['setup_path', 'tables_path', 'procedures_path', 'data_path']:
+                # Determine which script types to check based on migration_only
+                if migration_only:
+                    script_types = ['migration_path']
+                else:
+                    script_types = ['setup_path', 'tables_path', 'procedures_path', 'data_path']
+
+                for script_type in script_types:
                     script_path = main_database_scripts.get(script_type)
                     if script_path and os.path.exists(script_path):
                         if os.path.isfile(script_path):
@@ -933,39 +950,46 @@ class AiDeployAgent(AgentBase):
                                             return True
 
             # Check tenant database scripts
-            tenant_database_scripts = self._build_tenant_database_configs()
-            if tenant_database_scripts:
-                for tenant_config in tenant_database_scripts:
-                    for script_type in ['setup_path', 'tables_path', 'procedures_path', 'data_path']:
-                        script_path = tenant_config.get(script_type)
-                        if script_path and os.path.exists(script_path):
-                            if os.path.isfile(script_path):
-                                # Single file
-                                if os.path.getmtime(script_path) > last_deployment_timestamp:
-                                    self.logger.debug(f"Database file changed: {script_path}")
-                                    return True
-                            elif os.path.isdir(script_path):
-                                # Directory - check all .sql files
-                                for root, dirs, files in os.walk(script_path):
-                                    for file in files:
-                                        if file.endswith('.sql'):
-                                            file_path = os.path.join(root, file)
-                                            if os.path.getmtime(file_path) > last_deployment_timestamp:
-                                                self.logger.debug(f"Database file changed: {file_path}")
-                                                return True
+            # For migration_only, we need to check migration_path from the tenant-database config template
+            tenant_db_config = database_config.get('tenant-database', {})
+            if tenant_db_config.get('enabled', False):
+                # Determine which script types to check based on migration_only
+                if migration_only:
+                    script_types = ['migration_path']
+                else:
+                    script_types = ['setup_path', 'tables_path', 'procedures_path', 'data_path']
 
-            # Check tenant data scripts
-            tenant_data_scripts = database_config.get('tenant_data_scripts')
-            if tenant_data_scripts and tenant_data_scripts.get('enabled'):
-                data_path = tenant_data_scripts.get('data_path')
-                if data_path and os.path.exists(data_path) and os.path.isdir(data_path):
-                    for root, dirs, files in os.walk(data_path):
-                        for file in files:
-                            if file.endswith('.sql'):
-                                file_path = os.path.join(root, file)
-                                if os.path.getmtime(file_path) > last_deployment_timestamp:
-                                    self.logger.debug(f"Tenant data file changed: {file_path}")
-                                    return True
+                for script_type in script_types:
+                    script_path = tenant_db_config.get(script_type)
+                    if script_path and os.path.exists(script_path):
+                        if os.path.isfile(script_path):
+                            # Single file
+                            if os.path.getmtime(script_path) > last_deployment_timestamp:
+                                self.logger.debug(f"Database file changed: {script_path}")
+                                return True
+                        elif os.path.isdir(script_path):
+                            # Directory - check all .sql files
+                            for root, dirs, files in os.walk(script_path):
+                                for file in files:
+                                    if file.endswith('.sql'):
+                                        file_path = os.path.join(root, file)
+                                        if os.path.getmtime(file_path) > last_deployment_timestamp:
+                                            self.logger.debug(f"Database file changed: {file_path}")
+                                            return True
+
+            # Check tenant data scripts (skip if migration_only)
+            if not migration_only:
+                tenant_data_scripts = database_config.get('tenant_data_scripts')
+                if tenant_data_scripts and tenant_data_scripts.get('enabled'):
+                    data_path = tenant_data_scripts.get('data_path')
+                    if data_path and os.path.exists(data_path) and os.path.isdir(data_path):
+                        for root, dirs, files in os.walk(data_path):
+                            for file in files:
+                                if file.endswith('.sql'):
+                                    file_path = os.path.join(root, file)
+                                    if os.path.getmtime(file_path) > last_deployment_timestamp:
+                                        self.logger.debug(f"Tenant data file changed: {file_path}")
+                                        return True
 
             return False
 
@@ -986,6 +1010,7 @@ class AiDeployAgent(AgentBase):
             dry_run = self.config.get('options', {}).get('dry_run', False)
             ignore_cache = self.config.get('options', {}).get('ignore_cache', False)
             clean_install = self.config.get('options', {}).get('clean_install', False)
+            migration_only = self.config.get('options', {}).get('migration_only', False)
 
             # Get last deployment timestamp from cache
             db_cache = self.cache_data.get('database', {})
@@ -1004,7 +1029,10 @@ class AiDeployAgent(AgentBase):
                     return
 
             self.logger.warning("=" * 60)
-            self.logger.warning("DATABASE DEPLOYMENT")
+            if migration_only:
+                self.logger.warning("DATABASE MIGRATION")
+            else:
+                self.logger.warning("DATABASE DEPLOYMENT")
             self.logger.warning("=" * 60)
 
             # Create database handler
@@ -1037,7 +1065,8 @@ class AiDeployAgent(AgentBase):
                 tenant_data_scripts=tenant_data_scripts,
                 dry_run=dry_run,
                 last_deployment_timestamp=last_deployment_timestamp,
-                application_name=self.config.get('application_name')
+                application_name=self.config.get('application_name'),
+                migration_only=migration_only
             )
 
             if success:

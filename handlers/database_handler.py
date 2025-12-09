@@ -823,7 +823,8 @@ class DatabaseHandler:
         main_database_scripts: Optional[Dict] = None,
         dry_run: bool = False,
         last_deployment_timestamp: float = None,
-        application_name: str = None
+        application_name: str = None,
+        migration_only: bool = False
     ) -> Tuple[bool, bool, str]:
         """
         Deploy a single tenant database. This method can be run in parallel with other
@@ -837,6 +838,7 @@ class DatabaseHandler:
             dry_run: If True, only show what would be executed
             last_deployment_timestamp: Unix timestamp of last deployment
             application_name: Application name for template variables
+            migration_only: If True, only execute migration_path scripts (skip setup, tables, procedures)
 
         Returns:
             Tuple of (success: bool, any_scripts_executed: bool, tenant_name: str)
@@ -848,7 +850,10 @@ class DatabaseHandler:
         try:
 
             self.logger.warning("=" * 60)
-            self.logger.warning(f"DEPLOYING TENANT: {tenant_name}")
+            if migration_only:
+                self.logger.warning(f"MIGRATING TENANT: {tenant_name}")
+            else:
+                self.logger.warning(f"DEPLOYING TENANT: {tenant_name}")
             self.logger.warning("=" * 60)
 
             # Extract tenant webid from database name
@@ -878,67 +883,85 @@ class DatabaseHandler:
             # Check if tenant database exists
             tenant_db_exists = self.database_exists(tenant_name) if not dry_run else True
 
-            # Force setup scripts to run if database doesn't exist
-            tenant_setup_timestamp = last_deployment_timestamp if tenant_db_exists else None
-            if not tenant_db_exists and not dry_run:
-                self.logger.info(f"Database '{tenant_name}' does not exist, forcing setup scripts to run")
+            if migration_only:
+                # Migration mode: only execute migration_path scripts
+                if tenant_config.get('migration_path'):
+                    self.logger.info("=" * 60)
+                    self.logger.warning(f"Running migration scripts for tenant '{tenant_name}'")
+                    self.logger.info("=" * 60)
+                    dir_success, files_executed = self.execute_sql_directory(
+                        tenant_config['migration_path'], dry_run, use_database=True,
+                        template_vars=tenant_template_vars, database_name=tenant_name,
+                        last_deployment_timestamp=last_deployment_timestamp
+                    )
+                    if not dir_success:
+                        success = False
+                    if files_executed > 0:
+                        any_scripts_executed = True
+            else:
+                # Normal deployment mode: execute setup, tables, procedures
 
-            # 1. Execute tenant setup scripts
-            if tenant_config.get('setup_path'):
-                self.logger.info("=" * 60)
-                self.logger.warning(f"STEP 1: Running setup scripts for tenant '{tenant_name}'")
-                self.logger.info("=" * 60)
-                dir_success, files_executed = self.execute_sql_directory(
-                    tenant_config['setup_path'], dry_run, use_database=False,
-                    template_vars=tenant_template_vars, last_deployment_timestamp=tenant_setup_timestamp
-                )
-                if not dir_success:
-                    success = False
-                if files_executed > 0:
-                    any_scripts_executed = True
+                # Force setup scripts to run if database doesn't exist
+                tenant_setup_timestamp = last_deployment_timestamp if tenant_db_exists else None
+                if not tenant_db_exists and not dry_run:
+                    self.logger.info(f"Database '{tenant_name}' does not exist, forcing setup scripts to run")
 
-                    # Wait for database to be fully available after creation
-                    # This is important in parallel deployment to avoid "Unknown database" errors
-                    if not dry_run and not tenant_db_exists:
-                        self.logger.debug(f"Waiting for database '{tenant_name}' to become available...")
-                        if not self.wait_for_database(tenant_name):
-                            self.logger.error(f"Database '{tenant_name}' is not available - subsequent steps may fail")
-                            success = False
+                # 1. Execute tenant setup scripts
+                if tenant_config.get('setup_path'):
+                    self.logger.info("=" * 60)
+                    self.logger.warning(f"STEP 1: Running setup scripts for tenant '{tenant_name}'")
+                    self.logger.info("=" * 60)
+                    dir_success, files_executed = self.execute_sql_directory(
+                        tenant_config['setup_path'], dry_run, use_database=False,
+                        template_vars=tenant_template_vars, last_deployment_timestamp=tenant_setup_timestamp
+                    )
+                    if not dir_success:
+                        success = False
+                    if files_executed > 0:
+                        any_scripts_executed = True
 
-            # 2. Execute tenant table scripts
-            if tenant_config.get('tables_path'):
-                self.logger.info("=" * 60)
-                self.logger.warning(f"STEP 2: Creating tables for tenant '{tenant_name}'")
-                self.logger.info("=" * 60)
-                dir_success, files_executed = self.execute_sql_directory(
-                    tenant_config['tables_path'], dry_run, use_database=True,
-                    template_vars=tenant_template_vars, database_name=tenant_name,
-                    last_deployment_timestamp=last_deployment_timestamp
-                )
-                if not dir_success:
-                    success = False
-                if files_executed > 0:
-                    any_scripts_executed = True
+                        # Wait for database to be fully available after creation
+                        # This is important in parallel deployment to avoid "Unknown database" errors
+                        if not dry_run and not tenant_db_exists:
+                            self.logger.debug(f"Waiting for database '{tenant_name}' to become available...")
+                            if not self.wait_for_database(tenant_name):
+                                self.logger.error(f"Database '{tenant_name}' is not available - subsequent steps may fail")
+                                success = False
 
-            # 3. Execute tenant procedure scripts
-            if tenant_config.get('procedures_path'):
-                self.logger.info("=" * 60)
-                self.logger.warning(f"STEP 3: Creating procedures for tenant '{tenant_name}'")
-                self.logger.info("=" * 60)
-                dir_success, files_executed = self.execute_sql_directory(
-                    tenant_config['procedures_path'], dry_run, use_database=True,
-                    template_vars=tenant_template_vars, database_name=tenant_name,
-                    last_deployment_timestamp=last_deployment_timestamp
-                )
-                if not dir_success:
-                    success = False
-                if files_executed > 0:
-                    any_scripts_executed = True
+                # 2. Execute tenant table scripts
+                if tenant_config.get('tables_path'):
+                    self.logger.info("=" * 60)
+                    self.logger.warning(f"STEP 2: Creating tables for tenant '{tenant_name}'")
+                    self.logger.info("=" * 60)
+                    dir_success, files_executed = self.execute_sql_directory(
+                        tenant_config['tables_path'], dry_run, use_database=True,
+                        template_vars=tenant_template_vars, database_name=tenant_name,
+                        last_deployment_timestamp=last_deployment_timestamp
+                    )
+                    if not dir_success:
+                        success = False
+                    if files_executed > 0:
+                        any_scripts_executed = True
+
+                # 3. Execute tenant procedure scripts
+                if tenant_config.get('procedures_path'):
+                    self.logger.info("=" * 60)
+                    self.logger.warning(f"STEP 3: Creating procedures for tenant '{tenant_name}'")
+                    self.logger.info("=" * 60)
+                    dir_success, files_executed = self.execute_sql_directory(
+                        tenant_config['procedures_path'], dry_run, use_database=True,
+                        template_vars=tenant_template_vars, database_name=tenant_name,
+                        last_deployment_timestamp=last_deployment_timestamp
+                    )
+                    if not dir_success:
+                        success = False
+                    if files_executed > 0:
+                        any_scripts_executed = True
 
             return (success, any_scripts_executed, tenant_name)
 
         except Exception as e:
-            self.logger.error(f"Error deploying tenant '{tenant_name}': {e}")
+            self.logger.error(f"Error {'migrating' if migration_only else 'deploying'} tenant '{tenant_name}': {e}")
             return (False, False, tenant_name)
 
     def deploy_database(
@@ -950,7 +973,8 @@ class DatabaseHandler:
         tenant_data_scripts: Optional[dict] = None,
         dry_run: bool = False,
         last_deployment_timestamp: float = None,
-        application_name: str = None
+        application_name: str = None,
+        migration_only: bool = False
     ) -> tuple[bool, bool]:
         """
         Deploy database by executing main and tenant scripts in order.
@@ -959,12 +983,13 @@ class DatabaseHandler:
         Args:
             admin_username: Admin username for template variables
             admin_password: Admin password for template variables
-            main_database_scripts: Dictionary with db_name, db_username, db_password, setup_path, tables_path, procedures_path, data_path
-            tenant_database_scripts: List of dictionaries, each with db_name, db_username, db_password, setup_path, tables_path, procedures_path, data_path
+            main_database_scripts: Dictionary with db_name, db_username, db_password, setup_path, tables_path, procedures_path, data_path, migration_path
+            tenant_database_scripts: List of dictionaries, each with db_name, db_username, db_password, setup_path, tables_path, procedures_path, data_path, migration_path
             tenant_data_scripts: Dictionary with enabled, data_path - executed ONCE for all tenants (files use explicit USE statements)
             dry_run: If True, only show what would be executed
             last_deployment_timestamp: Unix timestamp of last deployment, skip SQL files older than this
             application_name: Application name for {{APPLICATION_NAME}} template variable replacement
+            migration_only: If True, only execute migration_path scripts (skip setup, tables, procedures, data)
 
         Returns:
             Tuple of (success: bool, any_scripts_executed: bool)
@@ -981,7 +1006,10 @@ class DatabaseHandler:
             # MAIN DATABASE DEPLOYMENT
             if main_database_scripts:
                 self.logger.warning("=" * 60)
-                self.logger.warning("MAIN DATABASE DEPLOYMENT")
+                if migration_only:
+                    self.logger.warning("MAIN DATABASE MIGRATION")
+                else:
+                    self.logger.warning("MAIN DATABASE DEPLOYMENT")
                 self.logger.warning("=" * 60)
 
                 # Build template variables for main database
@@ -1000,66 +1028,87 @@ class DatabaseHandler:
                 main_db_name = main_database_scripts.get('db_name')
                 main_db_exists = self.database_exists(main_db_name) if not dry_run else True
 
-                # Force setup scripts to run if database doesn't exist
-                setup_timestamp = last_deployment_timestamp if main_db_exists else None
-                if not main_db_exists and not dry_run:
-                    self.logger.info(f"Database '{main_db_name}' does not exist, forcing setup scripts to run")
+                if migration_only:
+                    # Migration mode: only execute migration_path scripts
+                    if main_database_scripts.get('migration_path'):
+                        self.logger.info("=" * 60)
+                        self.logger.warning("Running main database migration scripts")
+                        self.logger.info("=" * 60)
+                        dir_success, files_executed = self.execute_sql_directory(
+                            main_database_scripts['migration_path'], dry_run, use_database=True,
+                            template_vars=main_template_vars, database_name=main_db_name,
+                            last_deployment_timestamp=last_deployment_timestamp
+                        )
+                        if not dir_success:
+                            success = False
+                        if files_executed > 0:
+                            any_scripts_executed = True
+                else:
+                    # Normal deployment mode: execute setup, tables, procedures, data
 
-                # 1. Execute main setup scripts (without specifying database name)
-                if main_database_scripts.get('setup_path'):
-                    self.logger.info("=" * 60)
-                    self.logger.warning("STEP 1: Running main database setup scripts")
-                    self.logger.info("=" * 60)
-                    dir_success, files_executed = self.execute_sql_directory(main_database_scripts['setup_path'], dry_run, use_database=False, template_vars=main_template_vars, last_deployment_timestamp=setup_timestamp)
-                    if not dir_success:
-                        success = False
-                    if files_executed > 0:
-                        any_scripts_executed = True
+                    # Force setup scripts to run if database doesn't exist
+                    setup_timestamp = last_deployment_timestamp if main_db_exists else None
+                    if not main_db_exists and not dry_run:
+                        self.logger.info(f"Database '{main_db_name}' does not exist, forcing setup scripts to run")
 
-                # 2. Execute main table scripts
-                if main_database_scripts.get('tables_path'):
-                    self.logger.info("=" * 60)
-                    self.logger.warning("STEP 2: Creating main database tables")
-                    self.logger.info("=" * 60)
-                    dir_success, files_executed = self.execute_sql_directory(main_database_scripts['tables_path'], dry_run, template_vars=main_template_vars, last_deployment_timestamp=last_deployment_timestamp)
-                    if not dir_success:
-                        success = False
-                    if files_executed > 0:
-                        any_scripts_executed = True
+                    # 1. Execute main setup scripts (without specifying database name)
+                    if main_database_scripts.get('setup_path'):
+                        self.logger.info("=" * 60)
+                        self.logger.warning("STEP 1: Running main database setup scripts")
+                        self.logger.info("=" * 60)
+                        dir_success, files_executed = self.execute_sql_directory(main_database_scripts['setup_path'], dry_run, use_database=False, template_vars=main_template_vars, last_deployment_timestamp=setup_timestamp)
+                        if not dir_success:
+                            success = False
+                        if files_executed > 0:
+                            any_scripts_executed = True
 
-                # 3. Execute main procedure scripts
-                if main_database_scripts.get('procedures_path'):
-                    self.logger.info("=" * 60)
-                    self.logger.warning("STEP 3: Creating main database procedures")
-                    self.logger.info("=" * 60)
-                    dir_success, files_executed = self.execute_sql_directory(main_database_scripts['procedures_path'], dry_run, template_vars=main_template_vars, last_deployment_timestamp=last_deployment_timestamp)
-                    if not dir_success:
-                        success = False
-                    if files_executed > 0:
-                        any_scripts_executed = True
+                    # 2. Execute main table scripts
+                    if main_database_scripts.get('tables_path'):
+                        self.logger.info("=" * 60)
+                        self.logger.warning("STEP 2: Creating main database tables")
+                        self.logger.info("=" * 60)
+                        dir_success, files_executed = self.execute_sql_directory(main_database_scripts['tables_path'], dry_run, template_vars=main_template_vars, last_deployment_timestamp=last_deployment_timestamp)
+                        if not dir_success:
+                            success = False
+                        if files_executed > 0:
+                            any_scripts_executed = True
 
-                # 4. Execute main data scripts
-                if main_database_scripts.get('data_path'):
-                    self.logger.info("=" * 60)
-                    self.logger.warning("STEP 4: Loading main database data")
-                    self.logger.info("=" * 60)
-                    dir_success, files_executed = self.execute_sql_directory(main_database_scripts['data_path'], dry_run, template_vars=main_template_vars, last_deployment_timestamp=last_deployment_timestamp)
-                    if not dir_success:
-                        success = False
-                    if files_executed > 0:
-                        any_scripts_executed = True
+                    # 3. Execute main procedure scripts
+                    if main_database_scripts.get('procedures_path'):
+                        self.logger.info("=" * 60)
+                        self.logger.warning("STEP 3: Creating main database procedures")
+                        self.logger.info("=" * 60)
+                        dir_success, files_executed = self.execute_sql_directory(main_database_scripts['procedures_path'], dry_run, template_vars=main_template_vars, last_deployment_timestamp=last_deployment_timestamp)
+                        if not dir_success:
+                            success = False
+                        if files_executed > 0:
+                            any_scripts_executed = True
+
+                    # 4. Execute main data scripts
+                    if main_database_scripts.get('data_path'):
+                        self.logger.info("=" * 60)
+                        self.logger.warning("STEP 4: Loading main database data")
+                        self.logger.info("=" * 60)
+                        dir_success, files_executed = self.execute_sql_directory(main_database_scripts['data_path'], dry_run, template_vars=main_template_vars, last_deployment_timestamp=last_deployment_timestamp)
+                        if not dir_success:
+                            success = False
+                        if files_executed > 0:
+                            any_scripts_executed = True
 
             # TENANT DATABASE DEPLOYMENT (PARALLEL)
             if tenant_database_scripts:
                 self.logger.warning("=" * 60)
-                self.logger.warning("TENANT DATABASE DEPLOYMENT (PARALLEL)")
+                if migration_only:
+                    self.logger.warning("TENANT DATABASE MIGRATION (PARALLEL)")
+                else:
+                    self.logger.warning("TENANT DATABASE DEPLOYMENT (PARALLEL)")
                 self.logger.warning("=" * 60)
-                self.logger.info(f"Deploying {len(tenant_database_scripts)} tenant databases in parallel...")
+                self.logger.info(f"{'Migrating' if migration_only else 'Deploying'} {len(tenant_database_scripts)} tenant databases in parallel...")
 
                 # Deploy all tenants in parallel
                 # Paramiko's exec_command creates new channels per call, which is thread-safe
                 max_workers = min(len(tenant_database_scripts), 4)  # Cap at 4 concurrent tenant deployments
-                self.logger.info(f"Using {max_workers} parallel workers for tenant deployment")
+                self.logger.info(f"Using {max_workers} parallel workers for tenant {'migration' if migration_only else 'deployment'}")
 
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:
                     # Submit all tenant deployment tasks
@@ -1072,7 +1121,8 @@ class DatabaseHandler:
                             main_database_scripts,
                             dry_run,
                             last_deployment_timestamp,
-                            application_name
+                            application_name,
+                            migration_only
                         ): tenant_config.get('db_name')
                         for tenant_config in tenant_database_scripts
                     }
@@ -1085,23 +1135,24 @@ class DatabaseHandler:
                             tenant_success, tenant_any_scripts, _ = future.result()
                             completed += 1
                             if tenant_success:
-                                self.logger.info(f"[{completed}/{len(tenant_database_scripts)}] ✓ Completed deployment for tenant: {tenant_name}")
+                                self.logger.info(f"[{completed}/{len(tenant_database_scripts)}] ✓ Completed {'migration' if migration_only else 'deployment'} for tenant: {tenant_name}")
                             else:
-                                self.logger.error(f"[{completed}/{len(tenant_database_scripts)}] ✗ Failed deployment for tenant: {tenant_name}")
+                                self.logger.error(f"[{completed}/{len(tenant_database_scripts)}] ✗ Failed {'migration' if migration_only else 'deployment'} for tenant: {tenant_name}")
                                 success = False
                             if tenant_any_scripts:
                                 any_scripts_executed = True
                         except Exception as e:
                             completed += 1
-                            self.logger.error(f"[{completed}/{len(tenant_database_scripts)}] ✗ Exception deploying tenant {tenant_name}: {e}")
+                            self.logger.error(f"[{completed}/{len(tenant_database_scripts)}] ✗ Exception {'migrating' if migration_only else 'deploying'} tenant {tenant_name}: {e}")
                             success = False
 
                 self.logger.warning("=" * 60)
-                self.logger.warning(f"All {len(tenant_database_scripts)} tenant deployments completed")
+                self.logger.warning(f"All {len(tenant_database_scripts)} tenant {'migrations' if migration_only else 'deployments'} completed")
                 self.logger.warning("=" * 60)
 
             # TENANT DATA SCRIPTS (Executed once after all tenants are created)
-            if tenant_data_scripts and tenant_data_scripts.get('enabled') and tenant_data_scripts.get('data_path'):
+            # Skip if migration_only - migrations don't include data scripts
+            if not migration_only and tenant_data_scripts and tenant_data_scripts.get('enabled') and tenant_data_scripts.get('data_path'):
                 self.logger.warning("=" * 60)
                 self.logger.warning("TENANT DATA SCRIPTS")
                 self.logger.warning("=" * 60)

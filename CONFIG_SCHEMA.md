@@ -256,6 +256,7 @@ The `ignore` object specifies patterns for files and folders to skip during sync
 | `verbose` | boolean | No | true | If true, shows detailed progress messages. If false, only shows essential actions (files copied/updated/deleted, SQL files executed) |
 | `ignore_cache` | boolean | No | false | If true, ignores deployment cache and performs full comparison. If false, uses cache to skip unchanged files for faster incremental deployments |
 | `clean_install` | boolean | No | false | If true, deletes all destination files and databases before deployment. Forces full re-deployment ignoring cache. Requires user confirmation. |
+| `migration_only` | boolean | No | false | If true, only executes migration scripts (migration_path) instead of full database deployment. Cannot be used with `clean_install=true`. |
 | `max_concurrent_transfers` | integer | No | 20 | Maximum number of parallel file transfers (only applies when using SSH connections) |
 
 **Examples:**
@@ -337,6 +338,18 @@ Fast incremental deployment (uses cache, skips destination listing):
 }
 ```
 
+Migration only mode (only run database migration scripts):
+```json
+{
+  "options": {
+    "dry_run": false,
+    "migration_only": true
+  }
+}
+```
+
+**Note:** `migration_only` cannot be used with `clean_install=true` - an error will be thrown if both are set.
+
 ### Incremental Deployment and Cache System
 
 The ai-deploy agent uses a cache system to track deployed files and database scripts for faster incremental deployments.
@@ -412,6 +425,7 @@ The `database` object enables database deployment and seeding functionality via 
 | `tables_path` | string | No | Path to table creation scripts |
 | `procedures_path` | string | No | Path to stored procedure scripts |
 | `data_path` | string | No | Path to data SQL scripts (runs after procedures) |
+| `migration_path` | string | No | Path to migration SQL scripts (only executed when `options.migration_only=true`) |
 
 ### Tenant Database Scripts Object
 
@@ -427,6 +441,7 @@ The `tenant-database` object defines scripts that are executed **for each tenant
 | `tables_path` | string | No | Path to table creation scripts (executed per tenant) |
 | `procedures_path` | string | No | Path to stored procedure scripts (executed per tenant) |
 | `data_path` | string | No | Path to data SQL scripts (executed per tenant) |
+| `migration_path` | string | No | Path to migration SQL scripts (only executed when `options.migration_only=true`, executed per tenant) |
 
 **Note**: Scripts in these paths are executed once **per tenant**. Each tenant's database is created using template variables like `{{WEBID}}`.
 
@@ -520,7 +535,7 @@ INSERT INTO website_css (name, is_active, ...) VALUES ('default', 1, ...);
 }
 ```
 
-**Script Execution Order:**
+**Script Execution Order (Normal Deployment - `migration_only=false`):**
 
 1. **Main Database Scripts** (if configured):
    - `setup_path` - Database setup scripts (create database, users, grants)
@@ -536,6 +551,58 @@ INSERT INTO website_css (name, is_active, ...) VALUES ('default', 1, ...);
 
 3. **Tenant Data Scripts** (if configured, executed once after all tenant databases are created):
    - `data_path` - SQL files using explicit `USE` statements to insert data into specific databases
+
+**Script Execution Order (Migration Mode - `migration_only=true`):**
+
+When `options.migration_only=true`, only migration scripts are executed:
+
+1. **Main Database Migration** (if configured):
+   - `migration_path` - Migration SQL scripts for main database
+
+2. **Tenant Database Migration** (if configured, executed per tenant):
+   - `migration_path` - Migration SQL scripts for each tenant database
+
+**Note:** In migration mode, `setup_path`, `tables_path`, `procedures_path`, `data_path`, and `tenant_data_scripts` are all **skipped**.
+
+### Migration Mode
+
+Migration mode (`options.migration_only=true`) is designed for running database schema changes on an existing database without re-running setup, table creation, or data scripts. This is useful for:
+
+- Adding new columns to existing tables
+- Creating new tables without re-running all table scripts
+- Modifying stored procedures
+- Running one-time data fixes
+
+**Key behaviors:**
+- Only executes scripts in `migration_path` directories
+- Skips all other script paths (setup, tables, procedures, data)
+- Cannot be used with `clean_install=true` (will throw an error)
+- Uses the same incremental cache system (only executes changed migration scripts)
+
+**Example configuration for migration mode:**
+```json
+{
+  "database": {
+    "enabled": true,
+    "main_database_scripts": {
+      "db_name": "myapp",
+      "db_username": "myapp_user",
+      "db_password": "password",
+      "migration_path": "C:\\git\\myapp\\database\\main\\migration"
+    },
+    "tenant-database": {
+      "enabled": true,
+      "db_name": "myapp_{{WEBID}}",
+      "db_username": "myapp_user",
+      "db_password": "password",
+      "migration_path": "C:\\git\\myapp\\database\\tenant\\migration"
+    }
+  },
+  "options": {
+    "migration_only": true
+  }
+}
+```
 
 ## Complete Example Configurations
 

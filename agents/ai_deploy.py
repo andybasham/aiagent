@@ -4,6 +4,7 @@ import json
 import fnmatch
 import glob
 import time
+import subprocess
 from datetime import datetime
 from typing import Dict, Any, List, Set, Optional, Tuple
 from pathlib import Path
@@ -287,6 +288,48 @@ class AiDeployAgent(AgentBase):
             if not isinstance(ignore_config, dict):
                 raise ValueError("website.ignore must be a dictionary")
 
+        # Validate pre_build config if present
+        if 'pre_build' in website:
+            self._validate_pre_build_config(website['pre_build'])
+
+    def _validate_pre_build_config(self, pre_build: Dict[str, Any]) -> None:
+        """Validate pre_build configuration."""
+        if not isinstance(pre_build, dict):
+            raise ValueError("website.pre_build must be a dictionary")
+
+        # If not enabled, skip validation
+        if not pre_build.get('enabled', False):
+            return
+
+        # Validate working_directory
+        if 'working_directory' not in pre_build:
+            raise ValueError("website.pre_build.working_directory is required when enabled")
+        working_dir = pre_build['working_directory']
+        if not isinstance(working_dir, str):
+            raise ValueError("website.pre_build.working_directory must be a string")
+        if not os.path.exists(working_dir):
+            raise ValueError(f"website.pre_build.working_directory does not exist: {working_dir}")
+        if not os.path.isdir(working_dir):
+            raise ValueError(f"website.pre_build.working_directory is not a directory: {working_dir}")
+
+        # Validate command
+        if 'command' not in pre_build:
+            raise ValueError("website.pre_build.command is required when enabled")
+        if not isinstance(pre_build['command'], str) or not pre_build['command'].strip():
+            raise ValueError("website.pre_build.command must be a non-empty string")
+
+        # Validate watch_patterns
+        if 'watch_patterns' not in pre_build:
+            raise ValueError("website.pre_build.watch_patterns is required when enabled")
+        watch_patterns = pre_build['watch_patterns']
+        if not isinstance(watch_patterns, list):
+            raise ValueError("website.pre_build.watch_patterns must be a list")
+        if len(watch_patterns) == 0:
+            raise ValueError("website.pre_build.watch_patterns must not be empty")
+        for pattern in watch_patterns:
+            if not isinstance(pattern, str) or not pattern.strip():
+                raise ValueError("website.pre_build.watch_patterns must contain non-empty strings")
+
     def _validate_database_config(self, database: Dict[str, Any]) -> None:
         """Validate database configuration."""
         if not database.get('enabled', False):
@@ -522,6 +565,148 @@ class AiDeployAgent(AgentBase):
             logger=self.logger
         )
         return handler
+
+    def _should_run_pre_build(self) -> Tuple[bool, List[str]]:
+        """
+        Check if pre-build should run based on source file changes.
+
+        Returns:
+            Tuple of (should_run, changed_files)
+        """
+        website_config = self.config.get('website', {})
+        pre_build_config = website_config.get('pre_build', {})
+
+        if not pre_build_config.get('enabled', False):
+            return False, []
+
+        working_dir = pre_build_config['working_directory']
+        watch_patterns = pre_build_config['watch_patterns']
+
+        # Get cached file mtimes
+        cached_pre_build = self.cache_data.get('pre_build', {})
+        cached_files = cached_pre_build.get('files', {})
+
+        changed_files = []
+
+        for pattern in watch_patterns:
+            # Use glob to find all matching files
+            full_pattern = os.path.join(working_dir, pattern)
+            matched_files = glob.glob(full_pattern, recursive=True)
+
+            for file_path in matched_files:
+                if not os.path.isfile(file_path):
+                    continue
+
+                # Get relative path for cache key
+                rel_path = os.path.relpath(file_path, working_dir)
+                rel_path = self._normalize_path(rel_path)
+
+                try:
+                    current_mtime = os.path.getmtime(file_path)
+                except OSError:
+                    continue
+
+                cached_mtime = cached_files.get(rel_path)
+
+                # File is new or modified
+                if cached_mtime is None or current_mtime > cached_mtime:
+                    changed_files.append(rel_path)
+
+        return len(changed_files) > 0, changed_files
+
+    def _execute_pre_build(self) -> bool:
+        """
+        Execute the pre-build command.
+
+        Returns:
+            True if build succeeded, raises exception on failure
+        """
+        website_config = self.config.get('website', {})
+        pre_build_config = website_config.get('pre_build', {})
+
+        working_dir = pre_build_config['working_directory']
+        command = pre_build_config['command']
+
+        self.logger.warning(f"Running: {command}")
+        self.logger.warning(f"Working directory: {working_dir}")
+
+        dry_run = self.config.get('options', {}).get('dry_run', False)
+        if dry_run:
+            self.logger.warning("  [DRY RUN] Would execute pre-build command")
+            return True
+
+        try:
+            # Pass current environment to ensure PATH is available (important for npm on Windows)
+            result = subprocess.run(
+                command,
+                shell=True,
+                cwd=working_dir,
+                capture_output=True,
+                text=True,
+                env=os.environ.copy()
+            )
+
+            # Log stdout line by line
+            if result.stdout:
+                for line in result.stdout.strip().split('\n'):
+                    if line:
+                        self.logger.warning(f"  {line}")
+
+            # Check for failure
+            if result.returncode != 0:
+                self.logger.error(f"Pre-build failed with exit code {result.returncode}")
+                if result.stderr:
+                    for line in result.stderr.strip().split('\n'):
+                        if line:
+                            self.logger.error(f"  {line}")
+                raise RuntimeError(f"Pre-build failed: {command}")
+
+            self.logger.warning("Pre-build complete")
+
+            # Update cache with new file mtimes
+            self._update_pre_build_cache()
+
+            return True
+
+        except subprocess.SubprocessError as e:
+            self.logger.error(f"Failed to execute pre-build command: {e}")
+            raise RuntimeError(f"Pre-build execution failed: {e}")
+
+    def _update_pre_build_cache(self) -> None:
+        """Update the pre-build cache with current file mtimes."""
+        website_config = self.config.get('website', {})
+        pre_build_config = website_config.get('pre_build', {})
+
+        if not pre_build_config.get('enabled', False):
+            return
+
+        working_dir = pre_build_config['working_directory']
+        watch_patterns = pre_build_config['watch_patterns']
+
+        files_cache = {}
+
+        for pattern in watch_patterns:
+            full_pattern = os.path.join(working_dir, pattern)
+            matched_files = glob.glob(full_pattern, recursive=True)
+
+            for file_path in matched_files:
+                if not os.path.isfile(file_path):
+                    continue
+
+                rel_path = os.path.relpath(file_path, working_dir)
+                rel_path = self._normalize_path(rel_path)
+
+                try:
+                    files_cache[rel_path] = os.path.getmtime(file_path)
+                except OSError:
+                    continue
+
+        # Update cache structure
+        if 'pre_build' not in self.cache_data:
+            self.cache_data['pre_build'] = {}
+
+        self.cache_data['pre_build']['last_build_timestamp'] = time.time()
+        self.cache_data['pre_build']['files'] = files_cache
 
     def _should_ignore(self, file_path: str) -> bool:
         """
@@ -1796,6 +1981,24 @@ class AiDeployAgent(AgentBase):
             self.cache_data = self._load_cache()  # Still load for structure
         else:
             self.cache_data = self._load_cache()
+
+        # Pre-build step (if configured)
+        website_config = self.config.get('website', {})
+        pre_build_config = website_config.get('pre_build', {})
+        if pre_build_config.get('enabled', False):
+            self._log_section("PRE-BUILD")
+            should_build, changed_files = self._should_run_pre_build()
+            if should_build:
+                if len(changed_files) <= 10:
+                    self.logger.warning(f"Source files changed ({len(changed_files)}):")
+                    for f in changed_files:
+                        self.logger.warning(f"  - {f}")
+                else:
+                    self.logger.warning(f"Source files changed: {len(changed_files)} files")
+                self._execute_pre_build()
+                self.deployment_made_changes = True
+            else:
+                self.logger.warning("No source files changed, skipping build")
 
         try:
             # Create handlers

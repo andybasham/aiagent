@@ -247,6 +247,108 @@ The `ignore` object specifies patterns for files and folders to skip during sync
 }
 ```
 
+## Website Configuration
+
+The `website` object configures website-specific deployment settings including destination path, file mappings, permissions scripts, and pre-build steps.
+
+### Website Fields
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `path` | string | Yes | Destination path on server (e.g., "/var/www/myapp") |
+| `pre_build` | object | No | Pre-build configuration for running local build commands before deployment |
+| `file_mappings` | array | No | File mapping configurations for copying files with different names |
+| `set_permissions_script` | string | No | Script to run on server after deployment for setting permissions |
+| `cronjobs` | object | No | Cronjobs setup configuration |
+| `ignore` | object | No | Website-specific ignore patterns |
+
+### Pre-Build Configuration
+
+The `pre_build` object allows you to run a local build command (e.g., `npm run build`) before syncing files to the destination. The build only runs when watched source files have changed since the last deployment.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `enabled` | boolean | Yes | Enable/disable pre-build step |
+| `working_directory` | string | Yes* | Local directory to run the build command in |
+| `command` | string | Yes* | Build command to execute (e.g., "npm run build:prod") |
+| `watch_patterns` | array | Yes* | Glob patterns for files to watch for changes |
+
+\* Required when `enabled: true`
+
+**How it works:**
+
+1. Before file sync begins, the agent checks if any files matching `watch_patterns` have changed since the last deployment
+2. If changes are detected, the `command` is executed in `working_directory`
+3. If the build fails (non-zero exit code), deployment is **aborted** to prevent deploying broken code
+4. If no changes are detected, the build is skipped (uses cached build output)
+5. The pre-build step runs **locally** on your machine, not on the server
+
+**Example:**
+```json
+{
+  "website": {
+    "path": "/var/www/agencyos",
+    "pre_build": {
+      "enabled": true,
+      "working_directory": "C:\\git\\agencyos",
+      "command": "npm run build:prod",
+      "watch_patterns": [
+        "web/src/**/*.js",
+        "web/public/js/**/*.js",
+        "web/css/**/*.css",
+        "web/public/css/**/*.css",
+        "build.config.mjs",
+        "package.json"
+      ]
+    }
+  }
+}
+```
+
+**Watch Pattern Examples:**
+
+```json
+{
+  "watch_patterns": [
+    "src/**/*.js",           // All JS files in src
+    "src/**/*.ts",           // All TypeScript files
+    "styles/**/*.css",       // All CSS files
+    "package.json",          // Package dependencies
+    "webpack.config.js",     // Build configuration
+    "tsconfig.json"          // TypeScript configuration
+  ]
+}
+```
+
+**Output when files changed:**
+```
+Pre-build check...
+  Source files changed (3):
+    - web/src/public/features/give.js
+    - web/css/shared/buttons.css
+    - package.json
+Running pre-build: npm run build:prod
+Working directory: C:\git\agencyos
+  > agencyos@1.0.0 build:prod
+  > node build.config.mjs
+  Building JavaScript bundles...
+  ✓ public.full.js (24.2 KB)
+Pre-build complete
+```
+
+**Output when no changes:**
+```
+Pre-build check...
+  No source files changed, skipping build
+```
+
+**Notes:**
+- The pre-build cache is stored in the same deployment cache file (`.deploy_cache_*.json`)
+- Use `dry_run: true` to test without actually running the build
+- The build command is executed with `shell=True`, so you can use shell features
+- Build output (stdout) is logged in real-time
+- If build fails, the error output is logged and deployment stops
+
 ## Options Object
 
 | Field | Type | Required | Default | Description |

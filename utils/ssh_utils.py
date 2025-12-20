@@ -24,8 +24,10 @@ def load_ssh_private_key(key_file: str, passphrase: Optional[str] = None) -> par
         ('Ed25519', paramiko.Ed25519Key),
         ('RSA', paramiko.RSAKey),
         ('ECDSA', paramiko.ECDSAKey),
-        ('DSS', paramiko.DSSKey)
     ]
+    # DSSKey was removed in paramiko 3.0+ (DSS/DSA keys are deprecated)
+    if hasattr(paramiko, 'DSSKey'):
+        key_types.append(('DSS', paramiko.DSSKey))
 
     last_error = None
     for key_name, key_class in key_types:

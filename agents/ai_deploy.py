@@ -234,17 +234,15 @@ class AiDeployAgent(AgentBase):
         if not isinstance(tenants, dict):
             raise ValueError("tenants must be a dictionary")
 
-        # Validate config_files_path
-        if 'config_files_path' not in tenants:
-            raise ValueError("tenants.config_files_path is required")
+        # Validate path (directory containing tenant subdirectories)
+        if 'path' not in tenants:
+            raise ValueError("tenants.path is required")
 
-        config_files_path = tenants['config_files_path']
-        if not os.path.exists(config_files_path):
-            raise ValueError(f"tenants.config_files_path does not exist: {config_files_path}")
-        if not os.path.isdir(config_files_path):
-            raise ValueError(f"tenants.config_files_path is not a directory: {config_files_path}")
-
-        # config_files_extension is optional, defaults to .json
+        tenants_path = tenants['path']
+        if not os.path.exists(tenants_path):
+            raise ValueError(f"tenants.path does not exist: {tenants_path}")
+        if not os.path.isdir(tenants_path):
+            raise ValueError(f"tenants.path is not a directory: {tenants_path}")
 
     def _validate_website_config(self, website: Dict[str, Any]) -> None:
         """Validate website configuration."""
@@ -396,38 +394,37 @@ class AiDeployAgent(AgentBase):
 
     def _load_tenant_configs(self) -> List[Dict[str, Any]]:
         """
-        Load all tenant configuration files from the tenants directory.
+        Load tenant configurations by scanning subdirectories in the tenants directory.
+        Each subdirectory name becomes a tenant webid.
 
         Returns:
             List of tenant configuration dictionaries
         """
         tenants_config = self.config.get('tenants', {})
-        config_files_path = tenants_config.get('config_files_path')
-        config_files_extension = tenants_config.get('config_files_extension', '.json')
+        tenants_path = tenants_config.get('path')
 
-        if not config_files_path or not os.path.exists(config_files_path):
+        if not tenants_path or not os.path.exists(tenants_path):
             return []
 
         tenant_configs = []
 
-        # Get all JSON files in the directory
-        pattern = os.path.join(config_files_path, f'*{config_files_extension}')
-        config_files = sorted(glob.glob(pattern))
+        # Get all subdirectories in the tenants path
+        try:
+            for item in sorted(os.listdir(tenants_path)):
+                item_path = os.path.join(tenants_path, item)
 
-        for config_file in config_files:
-            # Skip example files and README
-            filename = os.path.basename(config_file).lower()
-            if 'example' in filename or 'readme' in filename or 'template' in filename:
-                continue
+                # Skip files and hidden directories
+                if not os.path.isdir(item_path) or item.startswith('.') or item.startswith('_'):
+                    continue
 
-            try:
-                with open(config_file, 'r', encoding='utf-8') as f:
-                    tenant_data = json.load(f)
-                    # Add the config file path to the tenant data
-                    tenant_data['_config_file_path'] = config_file
-                    tenant_configs.append(tenant_data)
-            except Exception as e:
-                self.logger.warning(f"Failed to load tenant config {config_file}: {e}")
+                # Create tenant config with subdirectory name as webid
+                tenant_data = {
+                    'webid': item,
+                    '_tenant_path': item_path
+                }
+                tenant_configs.append(tenant_data)
+        except Exception as e:
+            self.logger.warning(f"Failed to scan tenant directories in {tenants_path}: {e}")
 
         return tenant_configs
 

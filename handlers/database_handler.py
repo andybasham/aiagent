@@ -498,6 +498,73 @@ class DatabaseHandler:
             self.logger.error(f"Error executing SQL command: {e}")
             return False
 
+    def execute_query(self, query: str, database_name: str = None) -> List[Dict[str, Any]]:
+        """
+        Execute a SELECT query and return the results.
+
+        Args:
+            query: SQL SELECT query to execute
+            database_name: Optional database name to use
+
+        Returns:
+            List of dictionaries, each representing a row with column names as keys.
+            Returns empty list on error.
+        """
+        try:
+            self.logger.debug(f"Executing query: {query}")
+
+            # Upload SQL to temp file to avoid shell escaping issues
+            temp_sql_path = f"/tmp/query_{uuid.uuid4().hex}.sql"
+            sftp = self.ssh_client.open_sftp()
+            try:
+                with sftp.file(temp_sql_path, 'w') as remote_file:
+                    remote_file.write(query)
+            finally:
+                sftp.close()
+
+            # Build MySQL command with -N (skip column names) and -B (batch mode, tab-separated)
+            mysql_cmd = f"mysql -h {self.db_host} -P {self.db_port} -u {self.db_username} -p{self.db_password} -N -B"
+
+            if database_name:
+                mysql_cmd += f" {database_name}"
+
+            # Execute the query
+            stdin, stdout, stderr = self.ssh_client.exec_command(f"{mysql_cmd} < {temp_sql_path}")
+            exit_status = stdout.channel.recv_exit_status()
+
+            # Clean up temp file
+            self.ssh_client.exec_command(f"rm -f {temp_sql_path}")
+
+            if exit_status != 0:
+                error = stderr.read().decode()
+                self.logger.error(f"Error executing query: {error}")
+                return []
+
+            output = stdout.read().decode().strip()
+
+            if not output:
+                return []
+
+            # Parse results - each line is a row, columns are tab-separated
+            results = []
+            for line in output.split('\n'):
+                if line.strip():
+                    # For single-column results, return simple dict with 'value' key
+                    columns = line.split('\t')
+                    if len(columns) == 1:
+                        results.append({'value': columns[0]})
+                    else:
+                        # For multi-column, use column indices as keys
+                        row = {f'col_{i}': col for i, col in enumerate(columns)}
+                        results.append(row)
+
+            self.logger.debug(f"Query returned {len(results)} row(s)")
+            return results
+
+        except Exception as e:
+            self.logger.error(f"Error executing query: {e}")
+            return []
+
     def _extract_sql_template(self, table_script_file: str, begin_mark: str, end_mark: str) -> Optional[str]:
         """
         Extract SQL INSERT template from between BEGIN and END markers in a SQL file.

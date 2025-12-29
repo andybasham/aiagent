@@ -150,7 +150,7 @@ class AiDeployAgent(AgentBase):
 
         # Validate tenants config if present
         if 'tenants' in config:
-            self._validate_tenants_config(config['tenants'])
+            self._validate_tenants_config(config['tenants'], config)
 
         # Validate website config if present
         if 'website' in config:
@@ -229,20 +229,34 @@ class AiDeployAgent(AgentBase):
             if 'password' not in location and 'key_file' not in location:
                 raise ValueError(f"{name} SSH configuration must have either 'password' or 'key_file'")
 
-    def _validate_tenants_config(self, tenants: Dict[str, Any]) -> None:
+    def _validate_tenants_config(self, tenants: Dict[str, Any], config: Dict[str, Any]) -> None:
         """Validate tenants configuration."""
         if not isinstance(tenants, dict):
             raise ValueError("tenants must be a dictionary")
 
-        # Validate path (directory containing tenant subdirectories)
-        if 'path' not in tenants:
-            raise ValueError("tenants.path is required")
+        has_path = 'path' in tenants
+        has_query = 'query' in tenants
 
-        tenants_path = tenants['path']
-        if not os.path.exists(tenants_path):
-            raise ValueError(f"tenants.path does not exist: {tenants_path}")
-        if not os.path.isdir(tenants_path):
-            raise ValueError(f"tenants.path is not a directory: {tenants_path}")
+        # Must have either path or query (query is preferred when both are present)
+        if not has_path and not has_query:
+            raise ValueError("tenants must have either 'path' or 'query'")
+
+        # Validate path if present (directory containing tenant subdirectories)
+        if has_path:
+            tenants_path = tenants['path']
+            if not os.path.exists(tenants_path):
+                raise ValueError(f"tenants.path does not exist: {tenants_path}")
+            if not os.path.isdir(tenants_path):
+                raise ValueError(f"tenants.path is not a directory: {tenants_path}")
+
+        # Validate query if present
+        if has_query:
+            query = tenants['query']
+            if not isinstance(query, str) or not query.strip():
+                raise ValueError("tenants.query must be a non-empty string")
+            # Query requires database configuration
+            if 'database' not in config or not config['database'].get('enabled', False):
+                raise ValueError("tenants.query requires database configuration to be enabled")
 
     def _validate_website_config(self, website: Dict[str, Any]) -> None:
         """Validate website configuration."""
@@ -394,37 +408,65 @@ class AiDeployAgent(AgentBase):
 
     def _load_tenant_configs(self) -> List[Dict[str, Any]]:
         """
-        Load tenant configurations by scanning subdirectories in the tenants directory.
-        Each subdirectory name becomes a tenant webid.
+        Load tenant configurations from database query or by scanning subdirectories.
+
+        If tenants.query is specified, queries the database for tenant webids.
+        Otherwise, scans the tenants.path directory for subdirectories.
 
         Returns:
             List of tenant configuration dictionaries
         """
         tenants_config = self.config.get('tenants', {})
+        tenants_query = tenants_config.get('query')
         tenants_path = tenants_config.get('path')
-
-        if not tenants_path or not os.path.exists(tenants_path):
-            return []
 
         tenant_configs = []
 
-        # Get all subdirectories in the tenants path
-        try:
-            for item in sorted(os.listdir(tenants_path)):
-                item_path = os.path.join(tenants_path, item)
+        # Prefer query over path if both are specified
+        if tenants_query and self.db_handler:
+            # Query the database for tenant webids
+            try:
+                # Get the main database name for the query
+                database_config = self.config.get('database', {})
+                main_db_name = database_config.get('main_database_scripts', {}).get('db_name')
 
-                # Skip files and hidden directories
-                if not os.path.isdir(item_path) or item.startswith('.') or item.startswith('_'):
-                    continue
+                self.logger.info(f"Querying database for tenants: {tenants_query}")
+                results = self.db_handler.execute_query(tenants_query, database_name=main_db_name)
 
-                # Create tenant config with subdirectory name as webid
-                tenant_data = {
-                    'webid': item,
-                    '_tenant_path': item_path
-                }
-                tenant_configs.append(tenant_data)
-        except Exception as e:
-            self.logger.warning(f"Failed to scan tenant directories in {tenants_path}: {e}")
+                for row in results:
+                    # Get the webid from the first column (or 'value' key for single-column results)
+                    webid = row.get('value') or row.get('col_0')
+                    if webid:
+                        tenant_data = {
+                            'webid': webid,
+                            '_tenant_path': None  # No local path when using query
+                        }
+                        tenant_configs.append(tenant_data)
+
+                self.logger.info(f"Found {len(tenant_configs)} tenant(s) from database query")
+
+            except Exception as e:
+                self.logger.error(f"Failed to query tenants from database: {e}")
+                return []
+
+        elif tenants_path and os.path.exists(tenants_path):
+            # Scan directory for tenant subdirectories
+            try:
+                for item in sorted(os.listdir(tenants_path)):
+                    item_path = os.path.join(tenants_path, item)
+
+                    # Skip files and hidden directories
+                    if not os.path.isdir(item_path) or item.startswith('.') or item.startswith('_'):
+                        continue
+
+                    # Create tenant config with subdirectory name as webid
+                    tenant_data = {
+                        'webid': item,
+                        '_tenant_path': item_path
+                    }
+                    tenant_configs.append(tenant_data)
+            except Exception as e:
+                self.logger.warning(f"Failed to scan tenant directories in {tenants_path}: {e}")
 
         return tenant_configs
 
@@ -719,6 +761,9 @@ class AiDeployAgent(AgentBase):
         website_config = self.config.get('website', {})
         ignore_config = website_config.get('ignore', {})
 
+        # Normalize path for consistent comparison
+        normalized_path = self._normalize_path(file_path)
+
         # Check ignored files
         for pattern in ignore_config.get('files', []):
             if fnmatch.fnmatch(file_path, pattern):
@@ -727,9 +772,22 @@ class AiDeployAgent(AgentBase):
         # Check ignored folders
         path_parts = Path(file_path).parts
         for pattern in ignore_config.get('folders', []):
-            for part in path_parts:
-                if fnmatch.fnmatch(part, pattern):
+            # Normalize pattern to use forward slashes
+            normalized_pattern = pattern.replace('\\', '/')
+
+            # Check if pattern contains path separator (e.g., "web/tenants")
+            if '/' in normalized_pattern:
+                # Check if the file path starts with or contains the folder pattern
+                if normalized_path.startswith(normalized_pattern + '/') or normalized_path == normalized_pattern:
                     return True
+                # Also check if pattern appears as a path segment
+                if ('/' + normalized_pattern + '/') in ('/' + normalized_path):
+                    return True
+            else:
+                # Simple folder name - check against individual path parts
+                for part in path_parts:
+                    if fnmatch.fnmatch(part, pattern):
+                        return True
 
         # Check ignored extensions
         file_ext = Path(file_path).suffix

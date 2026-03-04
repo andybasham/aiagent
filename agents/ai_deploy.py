@@ -1538,9 +1538,9 @@ class AiDeployAgent(AgentBase):
         try:
             dry_run = self.config.get('options', {}).get('dry_run', False)
 
-            self.logger.info("=" * 60)
-            self.logger.info("SETTING PERMISSIONS")
-            self.logger.info("=" * 60)
+            self.logger.warning("=" * 60)
+            self.logger.warning("SETTING PERMISSIONS")
+            self.logger.warning("=" * 60)
 
             # Get SSH handler
             if not hasattr(self.dest_handler, 'ssh_client'):
@@ -1569,57 +1569,41 @@ class AiDeployAgent(AgentBase):
 
             # Make script executable
             self.logger.info(f"Making script executable: {full_script_path}")
-            chmod_cmd = f"echo '{ssh_password}' | sudo -S chmod +x {full_script_path}"
+            chmod_cmd = f"chmod +x {full_script_path}"
             stdin, stdout, stderr = ssh_client.exec_command(chmod_cmd)
             exit_status = stdout.channel.recv_exit_status()
 
-            # Read stderr but filter out the sudo password prompt
+            # Read stderr
             error_output = stderr.read().decode()
-            # Filter out common sudo password prompts
-            error_lines = [line for line in error_output.split('\n')
-                          if line.strip() and '[sudo]' not in line.lower()
-                          and 'password' not in line.lower()]
+            error_lines = [line for line in error_output.split('\n') if line.strip()]
 
             if exit_status != 0 and error_lines:
                 self.logger.error(f"Failed to make script executable: {chr(10).join(error_lines)}")
                 return
 
             # Execute the script
-            self.logger.info(f"Executing permissions script: {full_script_path}")
-            exec_cmd = f"cd {dest_base_path} && echo '{ssh_password}' | sudo -S bash {full_script_path}"
-            stdin, stdout, stderr = ssh_client.exec_command(exec_cmd)
+            self.logger.warning(f"Executing permissions script: {full_script_path}")
+            exec_cmd = f"cd {dest_base_path} && sudo -S bash {full_script_path}"
+            stdin, stdout, stderr = ssh_client.exec_command(exec_cmd, get_pty=True)
+            if ssh_password:
+                stdin.write(ssh_password + '\n')
+                stdin.flush()
 
-            # Stream output in real-time (including echo messages from script)
+            # Stream output in real-time (with get_pty, stderr is merged into stdout)
+            # Filter out sudo password prompts from output
             for line in stdout:
                 line_text = line.rstrip()
-                if line_text:  # Only log non-empty lines
+                if line_text and '[sudo]' not in line_text.lower() and 'password for' not in line_text.lower():
                     self.logger.info(f"  {line_text}")
 
             exit_status = stdout.channel.recv_exit_status()
 
-            # Read and filter stderr
-            error_output = stderr.read().decode()
-
             if exit_status != 0:
                 self.logger.error(f"Permissions script failed with exit code {exit_status}")
-
-                # Filter out sudo password prompts but show actual errors
-                error_lines = [line for line in error_output.split('\n')
-                              if line.strip() and '[sudo]' not in line.lower()
-                              and 'password for' not in line.lower()]
-
-                if error_lines:
-                    self.logger.error("Error output:")
-                    for line in error_lines:
-                        self.logger.error(f"  {line}")
-                else:
-                    # If no filtered errors, show raw stderr (might have useful info)
-                    if error_output.strip():
-                        self.logger.error(f"Raw error output: {error_output}")
             else:
-                self.logger.info("=" * 60)
-                self.logger.info("Permissions script executed successfully!")
-                self.logger.info("=" * 60)
+                self.logger.warning("=" * 60)
+                self.logger.warning("Permissions script executed successfully!")
+                self.logger.warning("=" * 60)
 
         except Exception as e:
             self.logger.error(f"Error executing permissions script: {e}")
@@ -1761,9 +1745,9 @@ class AiDeployAgent(AgentBase):
                     self.logger.info("No cronjobs files changed, skipping cronjobs script")
                     return
 
-            self.logger.info("=" * 60)
-            self.logger.info("SETTING UP CRONJOBS")
-            self.logger.info("=" * 60)
+            self.logger.warning("=" * 60)
+            self.logger.warning("SETTING UP CRONJOBS")
+            self.logger.warning("=" * 60)
 
             # Get SSH handler
             if not hasattr(self.dest_handler, 'ssh_client'):
@@ -1803,61 +1787,54 @@ class AiDeployAgent(AgentBase):
 
             # Make script executable
             self.logger.info(f"Making script executable: {full_script_path}")
-            chmod_cmd = f"echo '{ssh_password}' | sudo -S chmod +x {full_script_path}"
+            chmod_cmd = f"chmod +x {full_script_path}"
             stdin, stdout, stderr = ssh_client.exec_command(chmod_cmd)
             exit_status = stdout.channel.recv_exit_status()
 
-            # Read stderr but filter out the sudo password prompt
+            # Read stderr
             error_output = stderr.read().decode()
-            # Filter out common sudo password prompts
-            error_lines = [line for line in error_output.split('\n')
-                          if line.strip() and '[sudo]' not in line.lower()
-                          and 'password' not in line.lower()]
+            error_lines = [line for line in error_output.split('\n') if line.strip()]
 
             if exit_status != 0 and error_lines:
                 self.logger.error(f"Failed to make script executable: {chr(10).join(error_lines)}")
                 return
 
             # Execute the script
-            self.logger.info(f"Executing cronjobs script: {full_script_path}")
-            exec_cmd = f"cd {dest_base_path} && echo '{ssh_password}' | sudo -S bash {full_script_path}"
-            stdin, stdout, stderr = ssh_client.exec_command(exec_cmd)
+            self.logger.warning(f"Executing cronjobs script: {full_script_path}")
+            exec_cmd = f"cd {dest_base_path} && sudo -S bash {full_script_path}"
+            stdin, stdout, stderr = ssh_client.exec_command(exec_cmd, get_pty=True)
+            if ssh_password:
+                stdin.write(ssh_password + '\n')
+                stdin.flush()
 
-            # Stream output in real-time (including echo messages from script)
+            # Stream output in real-time (with get_pty, stderr is merged into stdout)
+            # Filter out sudo password prompts from output
+            output_lines = []
             for line in stdout:
                 line_text = line.rstrip()
-                if line_text:  # Only log non-empty lines
-                    self.logger.info(f"  {line_text}")
+                if line_text:
+                    output_lines.append(line_text)
+                    if '[sudo]' not in line_text.lower() and 'password for' not in line_text.lower():
+                        self.logger.warning(f"  {line_text}")
 
             exit_status = stdout.channel.recv_exit_status()
 
-            # Read and filter stderr
-            error_output = stderr.read().decode()
-
             if exit_status != 0:
                 self.logger.error(f"Cronjobs script failed with exit code {exit_status}")
-
-                # Filter out sudo password prompts but show actual errors
-                error_lines = [line for line in error_output.split('\n')
-                              if line.strip() and '[sudo]' not in line.lower()
-                              and 'password for' not in line.lower()]
-
+                # Show any error output that wasn't already logged
+                error_lines = [l for l in output_lines
+                              if '[sudo]' not in l.lower() and 'password for' not in l.lower()]
                 if error_lines:
-                    self.logger.error("Error output:")
                     for line in error_lines:
                         self.logger.error(f"  {line}")
-                else:
-                    # If no filtered errors, show raw stderr (might have useful info)
-                    if error_output.strip():
-                        self.logger.error(f"Raw error output: {error_output}")
             else:
                 # Update cache after successful execution
                 self._update_cronjobs_cache()
                 self.deployment_made_changes = True
 
-                self.logger.info("=" * 60)
-                self.logger.info("Cronjobs script executed successfully!")
-                self.logger.info("=" * 60)
+                self.logger.warning("=" * 60)
+                self.logger.warning("Cronjobs script executed successfully!")
+                self.logger.warning("=" * 60)
 
         except Exception as e:
             self.logger.error(f"Error executing cronjobs script: {e}")

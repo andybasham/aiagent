@@ -1519,6 +1519,12 @@ class AiDeployAgent(AgentBase):
         if not script_path:
             return
 
+        # Skip permissions script for migration-only deploys
+        migration_only = self.config.get('options', {}).get('migration_only', False)
+        if migration_only:
+            self.logger.info("Migration-only mode, skipping permissions script")
+            return
+
         # Skip if no file changes were made (optimization)
         # Permissions script does find/chmod on all files - unnecessary if no files changed
         if not files_changed:
@@ -1561,42 +1567,74 @@ class AiDeployAgent(AgentBase):
             # Get SSH password for sudo
             ssh_password = self.config['destination'].get('password', '')
 
-            # Fix line endings (convert Windows CRLF to Unix LF)
-            self.logger.info(f"Converting line endings to Unix format: {full_script_path}")
-            dos2unix_cmd = f"sed -i 's/\\r$//' {full_script_path}"
-            stdin, stdout, stderr = ssh_client.exec_command(dos2unix_cmd)
-            stdout.channel.recv_exit_status()  # Wait for completion
+            # Reconnect SSH to ensure clean channel state
+            # (parallel tenant migrations may have exhausted channel limits)
+            self.logger.info("Reconnecting SSH for permissions script...")
+            self.dest_handler.disconnect()
+            self.dest_handler.connect()
+            ssh_client = self.dest_handler.ssh_client
 
-            # Make script executable
-            self.logger.info(f"Making script executable: {full_script_path}")
-            chmod_cmd = f"chmod +x {full_script_path}"
-            stdin, stdout, stderr = ssh_client.exec_command(chmod_cmd)
-            exit_status = stdout.channel.recv_exit_status()
+            import time as _time
+            timeout_seconds = 120
+            self.logger.warning(f"Executing permissions script: {full_script_path} (timeout: {timeout_seconds}s)")
 
-            # Read stderr
-            error_output = stderr.read().decode()
-            error_lines = [line for line in error_output.split('\n') if line.strip()]
+            if ssh_password:
+                exec_cmd = (
+                    f"sed -i 's/\\r$//' {full_script_path} && "
+                    f"chmod +x {full_script_path} && "
+                    f"cd {dest_base_path} && "
+                    f"echo '{ssh_password}' | sudo -S bash {full_script_path} 2>&1"
+                )
+            else:
+                exec_cmd = (
+                    f"sed -i 's/\\r$//' {full_script_path} && "
+                    f"chmod +x {full_script_path} && "
+                    f"cd {dest_base_path} && "
+                    f"sudo bash {full_script_path} 2>&1"
+                )
 
-            if exit_status != 0 and error_lines:
-                self.logger.error(f"Failed to make script executable: {chr(10).join(error_lines)}")
+            stdin, stdout, stderr = ssh_client.exec_command(exec_cmd)
+            self.logger.info("Waiting for permissions script output...")
+
+            # Read output with wall-clock timeout to prevent hanging
+            channel = stdout.channel
+            output_buffer = ""
+            start_time = _time.time()
+            timed_out = False
+            while not channel.exit_status_ready():
+                elapsed = _time.time() - start_time
+                if elapsed > timeout_seconds:
+                    timed_out = True
+                    break
+                if channel.recv_ready():
+                    chunk = channel.recv(4096).decode('utf-8', errors='replace')
+                    output_buffer += chunk
+                    while '\n' in output_buffer:
+                        line_text, output_buffer = output_buffer.split('\n', 1)
+                        line_text = line_text.rstrip()
+                        if line_text and '[sudo]' not in line_text.lower() and 'password for' not in line_text.lower():
+                            self.logger.info(f"  {line_text}")
+                else:
+                    _time.sleep(0.5)
+
+            if timed_out:
+                self.logger.error(f"Permissions script timed out after {timeout_seconds}s")
+                if output_buffer.strip():
+                    self.logger.error(f"Last output: {output_buffer.strip()[-500:]}")
+                channel.close()
                 return
 
-            # Execute the script
-            self.logger.warning(f"Executing permissions script: {full_script_path}")
-            exec_cmd = f"cd {dest_base_path} && sudo -S bash {full_script_path}"
-            stdin, stdout, stderr = ssh_client.exec_command(exec_cmd, get_pty=True)
-            if ssh_password:
-                stdin.write(ssh_password + '\n')
-                stdin.flush()
+            # Read any remaining data after command finishes
+            while channel.recv_ready():
+                chunk = channel.recv(4096).decode('utf-8', errors='replace')
+                output_buffer += chunk
+            if output_buffer.strip():
+                for line_text in output_buffer.strip().split('\n'):
+                    line_text = line_text.rstrip()
+                    if line_text and '[sudo]' not in line_text.lower() and 'password for' not in line_text.lower():
+                        self.logger.info(f"  {line_text}")
 
-            # Stream output in real-time (with get_pty, stderr is merged into stdout)
-            # Filter out sudo password prompts from output
-            for line in stdout:
-                line_text = line.rstrip()
-                if line_text and '[sudo]' not in line_text.lower() and 'password for' not in line_text.lower():
-                    self.logger.info(f"  {line_text}")
-
-            exit_status = stdout.channel.recv_exit_status()
+            exit_status = channel.recv_exit_status()
 
             if exit_status != 0:
                 self.logger.error(f"Permissions script failed with exit code {exit_status}")
@@ -1772,56 +1810,79 @@ class AiDeployAgent(AgentBase):
             # Get SSH password for sudo
             ssh_password = self.config['destination'].get('password', '')
 
-            # Fix line endings for all PHP files in server_path (convert Windows CRLF to Unix LF)
+            # Reconnect SSH to ensure clean channel state
+            # (parallel tenant migrations may have exhausted channel limits)
+            self.logger.info("Reconnecting SSH for cronjobs script...")
+            self.dest_handler.disconnect()
+            self.dest_handler.connect()
+            ssh_client = self.dest_handler.ssh_client
+
+            # Combine all prep and execution into a single SSH command
+            import time as _time
+            timeout_seconds = 120
+            self.logger.warning(f"Executing cronjobs script: {full_script_path} (timeout: {timeout_seconds}s)")
+
+            prep_cmds = []
             if server_path:
-                self.logger.info(f"Converting line endings for PHP files in: {server_path}")
-                dos2unix_php_cmd = f"find {server_path} -name '*.php' -exec sed -i 's/\\r$//' {{}} \\;"
-                stdin, stdout, stderr = ssh_client.exec_command(dos2unix_php_cmd)
-                stdout.channel.recv_exit_status()  # Wait for completion
+                prep_cmds.append(f"find {server_path} -name '*.php' -exec sed -i 's/\\r$//' {{}} \\;")
+            prep_cmds.append(f"sed -i 's/\\r$//' {full_script_path}")
+            prep_cmds.append(f"chmod +x {full_script_path}")
 
-            # Fix line endings for the script itself
-            self.logger.info(f"Converting line endings to Unix format: {full_script_path}")
-            dos2unix_cmd = f"sed -i 's/\\r$//' {full_script_path}"
-            stdin, stdout, stderr = ssh_client.exec_command(dos2unix_cmd)
-            stdout.channel.recv_exit_status()  # Wait for completion
+            if ssh_password:
+                prep_cmds.append(f"cd {dest_base_path} && echo '{ssh_password}' | sudo -S bash {full_script_path} 2>&1")
+            else:
+                prep_cmds.append(f"cd {dest_base_path} && sudo bash {full_script_path} 2>&1")
 
-            # Make script executable
-            self.logger.info(f"Making script executable: {full_script_path}")
-            chmod_cmd = f"chmod +x {full_script_path}"
-            stdin, stdout, stderr = ssh_client.exec_command(chmod_cmd)
-            exit_status = stdout.channel.recv_exit_status()
+            exec_cmd = " && ".join(prep_cmds)
+            stdin, stdout, stderr = ssh_client.exec_command(exec_cmd)
 
-            # Read stderr
-            error_output = stderr.read().decode()
-            error_lines = [line for line in error_output.split('\n') if line.strip()]
+            # Read output with wall-clock timeout to prevent hanging
+            channel = stdout.channel
+            output_buffer = ""
+            output_lines = []
+            start_time = _time.time()
+            timed_out = False
+            while not channel.exit_status_ready():
+                elapsed = _time.time() - start_time
+                if elapsed > timeout_seconds:
+                    timed_out = True
+                    break
+                if channel.recv_ready():
+                    chunk = channel.recv(4096).decode('utf-8', errors='replace')
+                    output_buffer += chunk
+                    while '\n' in output_buffer:
+                        line_text, output_buffer = output_buffer.split('\n', 1)
+                        line_text = line_text.rstrip()
+                        if line_text:
+                            output_lines.append(line_text)
+                            if '[sudo]' not in line_text.lower() and 'password for' not in line_text.lower():
+                                self.logger.warning(f"  {line_text}")
+                else:
+                    _time.sleep(0.5)
 
-            if exit_status != 0 and error_lines:
-                self.logger.error(f"Failed to make script executable: {chr(10).join(error_lines)}")
+            if timed_out:
+                self.logger.error(f"Cronjobs script timed out after {timeout_seconds}s")
+                if output_buffer.strip():
+                    self.logger.error(f"Last output: {output_buffer.strip()[-500:]}")
+                channel.close()
                 return
 
-            # Execute the script
-            self.logger.warning(f"Executing cronjobs script: {full_script_path}")
-            exec_cmd = f"cd {dest_base_path} && sudo -S bash {full_script_path}"
-            stdin, stdout, stderr = ssh_client.exec_command(exec_cmd, get_pty=True)
-            if ssh_password:
-                stdin.write(ssh_password + '\n')
-                stdin.flush()
+            # Read any remaining data after command finishes
+            while channel.recv_ready():
+                chunk = channel.recv(4096).decode('utf-8', errors='replace')
+                output_buffer += chunk
+            if output_buffer.strip():
+                for line_text in output_buffer.strip().split('\n'):
+                    line_text = line_text.rstrip()
+                    if line_text:
+                        output_lines.append(line_text)
+                        if '[sudo]' not in line_text.lower() and 'password for' not in line_text.lower():
+                            self.logger.warning(f"  {line_text}")
 
-            # Stream output in real-time (with get_pty, stderr is merged into stdout)
-            # Filter out sudo password prompts from output
-            output_lines = []
-            for line in stdout:
-                line_text = line.rstrip()
-                if line_text:
-                    output_lines.append(line_text)
-                    if '[sudo]' not in line_text.lower() and 'password for' not in line_text.lower():
-                        self.logger.warning(f"  {line_text}")
-
-            exit_status = stdout.channel.recv_exit_status()
+            exit_status = channel.recv_exit_status()
 
             if exit_status != 0:
                 self.logger.error(f"Cronjobs script failed with exit code {exit_status}")
-                # Show any error output that wasn't already logged
                 error_lines = [l for l in output_lines
                               if '[sudo]' not in l.lower() and 'password for' not in l.lower()]
                 if error_lines:

@@ -1,0 +1,107 @@
+{
+  "agent_name": "ai-deploy",
+  "description": "Deploy AgencyOS to TEST",
+  "application_name": "agencyos",
+  "source": {
+    "type": "windows_share",
+    "path": "C:\\git\\{{APPLICATION_NAME}}"
+  },
+  "destination": {
+    "type": "ssh",
+    "host": "192.168.1.4",
+    "port": 22,
+    "username": "andy",
+    "password": "Agb1010andy!",
+    "key_file": "",
+    "passphrase": ""
+  },
+  "website": {
+    "path": "/var/www/{{APPLICATION_NAME}}",
+    "pre_build": {
+      "enabled": true,
+      "working_directory": "C:\\git\\{{APPLICATION_NAME}}",
+      "command": "npm run build:prod",
+      "watch_patterns": [
+        "web/src/**/*.js",
+        "web/public/js/**/*.js",
+        "web/css/**/*.css",
+        "web/public/css/**/*.css",
+        "web/portal/css/**/*.css",
+        "build.config.mjs",
+        "package.json"
+      ]
+    },
+    "file_mappings": [
+      {
+        "source": "C:\\git\\{{APPLICATION_NAME}}\\shared\\.env.test",
+        "destination": "shared/.env"
+      }
+    ],
+    "set_permissions_script": "scripts/set-permissions.sh",
+    "cronjobs": {
+      "script": "scripts/setup-cronjobs.sh",
+      "server_path": "/var/www/{{APPLICATION_NAME}}/cronjobs",
+      "local_path": "C:\\git\\{{APPLICATION_NAME}}\\cronjobs",
+      "create_table_file": "C:\\git\\{{APPLICATION_NAME}}\\database\\main\\tables\\cronjob.sql",
+      "insert_data_file": "C:\\git\\{{APPLICATION_NAME}}\\database\\main\\data\\main.sql"
+    },
+    "ignore": {
+      "files": [".env", ".env.local", ".env.example", "shared/.env.prod", "shared/.env.test", ".gitignore", ".DS_Store", "Thumbs.db", "desktop.ini"],
+      "folders": [".claude", ".git", ".vscode", ".idea", "deploy", "docs", "db", "database", "logs", "tmp", "temp", "node_modules", "cache", "sessions", "coverage", "archive", "vendor", "storage/logs", "storage/temp", "storage/uploads", "web/public/demo", "web/public/livingwater", "web/portal/demo", "web/portal/livingwater",  "web/tenants",  "storage/pending-tenants"],
+      "extensions": [".md", ".log", ".tmp", ".bak", ".backup", ".old", ".orig", ".cache", ".swp", ".swo", ".pem", ".key", ".p12", ".pfx", ".gz"]
+    }
+  },
+    "tenants": {
+    "path": "C:\\git\\{{APPLICATION_NAME}}\\web\\tenants",
+    "query": "select webid from tenant;"
+  },
+  "database": {
+    "enabled": true,
+    "ssh_host": "192.168.1.4",
+    "ssh_port": 22,
+    "ssh_username": "andy",
+    "ssh_password": "Agb1010andy!",
+    "key_file": "",
+    "ssh_passphrase": "",
+    "db_host": "127.0.0.1",
+    "db_port": 3306,
+    "admin_username": "andy",
+    "admin_password": "Agb1010andy!",
+    "main_database_scripts": {
+      "db_name": "{{APPLICATION_NAME}}",
+      "db_username": "{{APPLICATION_NAME}}_user",
+      "db_password": "7#Xy%A!!A2!mPq*L8Wr",
+      "setup_path": "C:\\git\\{{APPLICATION_NAME}}\\database\\main\\setup",
+      "tables_path": "C:\\git\\{{APPLICATION_NAME}}\\database\\main\\tables",
+      "procedures_path": "C:\\git\\{{APPLICATION_NAME}}\\database\\main\\procedures",
+      "data_path": "C:\\git\\{{APPLICATION_NAME}}\\database\\main\\data",
+      "migration_path": "C:\\git\\{{APPLICATION_NAME}}\\database\\main\\migration"
+    },
+    "tenant-database": {
+      "enabled": true,
+      "db_name": "{{APPLICATION_NAME}}_{{WEBID}}",
+      "db_username": "{{APPLICATION_NAME}}_user",
+      "db_password": "7#Xy%A!!A2!mPq*L8Wr",
+      "setup_path": "C:\\git\\{{APPLICATION_NAME}}\\database\\tenant\\setup",
+      "tables_path": "C:\\git\\{{APPLICATION_NAME}}\\database\\tenant\\tables",
+      "procedures_path": "C:\\git\\{{APPLICATION_NAME}}\\database\\tenant\\procedures",
+      "migration_path": "C:\\git\\{{APPLICATION_NAME}}\\database\\tenant\\migration"
+    },
+    "tenant_data_scripts": {
+      "enabled": true,
+      "data_path": "C:\\git\\{{APPLICATION_NAME}}\\database\\tenant\\data"
+    }
+  },
+  "options": {
+    "verbose": false,
+    "dry_run": false,
+    "delete_extra_files": true,
+    "ignore_cache": false,
+    "clean_install": false,
+    "warn": false,
+    "ssh_connection_pool_size": 10,
+    "max_concurrent_transfers": 20,
+    "enable_parallel_deployment": true,
+    "migration_only": true
+  }
+}

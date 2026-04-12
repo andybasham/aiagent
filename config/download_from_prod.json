@@ -1,0 +1,31 @@
+{
+  "agent_name": "ai-download",
+  "description": "Download files from PROD server",
+  "application_name": "agencyos",
+  "server": {
+    "type": "ssh",
+    "host": "172.234.198.20",
+    "port": 3147,
+    "username": "andy",
+    "password": "Agb1010andy!",
+    "key_file": "C:\\keys\\sitegusto-prod",
+    "passphrase": "",
+    "path": "/var/www/{{APPLICATION_NAME}}/web/tenants/getpcparts/images"
+  },
+  "local": {
+    "path": "C:\\Users\\andy\\Downloads"
+  },
+  "files": [
+    "17-wifi-card.png",
+    "17-wifi-card-hover.png",
+    "demo-wifi-01.webp",
+    "demo-wifi-02.webp",
+    "demo-wifi-03.webp",
+    "demo-wifi-04.webp"
+  ],
+  "options": {
+    "verbose": true,
+    "dry_run": false,
+    "overwrite_existing": true
+  }
+}

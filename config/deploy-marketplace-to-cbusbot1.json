@@ -1,0 +1,28 @@
+{
+  "agent_name": "ai-deploy",
+  "description": "Deploy Marketplace scripts to cbusbot1",
+  "application_name": "agencyos",
+  "source": {
+    "type": "windows_share",
+    "path": "C:\\git\\{{APPLICATION_NAME}}\\scripts\\marketplace"
+  },
+  "destination": {
+    "type": "windows_share",
+    "path": "\\\\cbusbot1\\share\\marketplace\\src"
+  },
+  "website": {
+    "path": "\\\\cbusbot1\\share\\marketplace\\src",
+    "ignore": {
+      "files": [".gitignore", ".DS_Store", "Thumbs.db", "desktop.ini"],
+      "folders": [".git", ".vscode", ".idea"],
+      "extensions": [".md", ".log", ".tmp", ".bak", ".backup", ".old", ".orig"]
+    }
+  },
+  "options": {
+    "verbose": false,
+    "dry_run": false,
+    "delete_extra_files": true,
+    "ignore_cache": true,
+    "clean_install": false
+  }
+}

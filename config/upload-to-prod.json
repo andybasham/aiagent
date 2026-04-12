@@ -1,0 +1,35 @@
+{
+  "agent_name": "ai-upload",
+  "description": "Upload files to PROD server",
+  "application_name": "agencyos",
+  "server": {
+    "type": "ssh",
+    "host": "172.234.198.20",
+    "port": 3147,
+    "username": "andy",
+    "password": "Agb1010andy!",
+    "key_file": "C:\\keys\\sitegusto-prod",
+    "passphrase": "",
+    "path": "/var/www/{{APPLICATION_NAME}}/web/tenants/getpcparts/images"
+  },
+  "local": {
+    "path": "C:\\Users\\andy\\Downloads\\new"
+  },
+  "files": [
+    "27-microphones.png",
+    "27-microphones-hover.png",
+    "28-webcams.png",
+    "28-webcams-hover.png",
+    "demo-microphone-01.webp",
+    "demo-microphone-02.webp",
+    "demo-microphone-03.webp",
+    "demo-webcam-01.webp",
+    "demo-webcam-02.webp",
+    "demo-webcam-03.webp"
+  ],
+  "options": {
+    "verbose": true,
+    "dry_run": false,
+    "overwrite_existing": true
+  }
+}

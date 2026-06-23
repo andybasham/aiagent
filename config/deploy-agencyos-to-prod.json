@@ -103,5 +103,12 @@
     "max_concurrent_transfers": 20,
     "enable_parallel_deployment": true,
     "migration_only": true
-  }
+  },
+  "post_deploy": [
+    "deploy-marketplace-to-cbusbot1.json",
+    "deploy-marketplace-to-cbusbot2.json",
+    "deploy-marketplace-to-cbusbot3.json",
+    "deploy-marketplace-to-cbusbot4.json",
+    "deploy-marketplace-to-cbusbot5.json"
+  ]
 }

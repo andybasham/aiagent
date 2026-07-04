@@ -8,7 +8,7 @@ of truth for every secret. Configs and templated files reference values with
 File format (one per line)::
 
     # comments and blank lines are ignored
-    DB_PASS=7#Xy%A!!A2!mPq*L8Wr
+    DB_PASS=example-not-a-real-value
     AUTH_SIGNING_KEY=abc123...
     PROD_SSH_PASSWORD="quotes are optional and stripped"
 

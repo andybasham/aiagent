@@ -5,6 +5,8 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Dict, Any
 
+from utils import secrets as secrets_util
+
 
 class CleanOutputFormatter(logging.Formatter):
     """Custom formatter that hides the level name for WARNING messages."""
@@ -46,6 +48,10 @@ class AgentBase(ABC):
             # Replace {{APPLICATION_NAME}} in all config values
             config = self._replace_application_name_in_config(config)
 
+            # Replace {{secret:NAME}} in all config values from the central
+            # secrets file (keeps SSH/DB passwords etc. out of the config JSON).
+            config = self._replace_secrets_in_config(config)
+
             self._validate_config(config)
             return config
         except FileNotFoundError:
@@ -84,6 +90,31 @@ class AgentBase(ABC):
             key: replace_in_value(value) if key != 'application_name' else value
             for key, value in config.items()
         }
+
+    def _replace_secrets_in_config(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Recursively replace {{secret:NAME}} in all config string values using
+        the central secrets file. The path can be set via the top-level
+        'secrets_file' config key or the AIAGENT_SECRETS_FILE env var; otherwise
+        the default (C:\\keys\\agencyos.txt) is used.
+
+        Fails loudly if a referenced secret is missing, so a partially-resolved
+        config never reaches the server.
+        """
+        secrets = secrets_util.load_secrets(config.get('secrets_file'))
+
+        def replace_in_value(value):
+            if isinstance(value, str):
+                if secrets_util.has_secret_placeholder(value):
+                    return secrets_util.substitute(value, secrets, where='config')
+                return value
+            elif isinstance(value, dict):
+                return {k: replace_in_value(v) for k, v in value.items()}
+            elif isinstance(value, list):
+                return [replace_in_value(item) for item in value]
+            return value
+
+        return {key: replace_in_value(value) for key, value in config.items()}
 
     def _setup_logger(self) -> logging.Logger:
         """Set up logger for the agent."""

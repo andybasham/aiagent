@@ -16,6 +16,7 @@ from handlers.windows_share_handler import WindowsShareHandler
 from handlers.ssh_handler import SSHHandler
 from handlers.database_handler import DatabaseHandler
 from utils.ssh_connection_pool import SSHConnectionPool
+from utils import secrets as secrets_util
 
 
 class AiDeployAgent(AgentBase):
@@ -1073,6 +1074,16 @@ class AiDeployAgent(AgentBase):
         # Get cached file mapping metadata
         file_mappings_cache = self.cache_data.get('file_mappings', {})
 
+        # Central secrets, used for mappings flagged with "render_secrets": true
+        # (e.g. shared/.env.prod -> shared/.env). Loaded once per run.
+        secrets = secrets_util.load_secrets(self.config.get('secrets_file'))
+
+        def _render(raw: bytes, where: str) -> bytes:
+            """Substitute {{secret:NAME}} placeholders in the file content."""
+            text = raw.decode('utf-8')
+            rendered = secrets_util.substitute(text, secrets, where=where)
+            return rendered.encode('utf-8')
+
         self.logger.warning("=" * 60)
         self.logger.warning("FILE MAPPINGS")
         self.logger.warning("=" * 60)
@@ -1083,11 +1094,15 @@ class AiDeployAgent(AgentBase):
         for mapping in file_mappings:
             source_path = mapping['source']
             dest_path = mapping['destination']
+            # Mappings that inject secrets are always re-rendered (a secret can
+            # change without the template's mtime changing), so they bypass the
+            # mtime cache below.
+            render = bool(mapping.get('render_secrets', False))
 
             try:
                 # Check if file has changed
                 needs_copy = True
-                if not ignore_cache and os.path.isabs(source_path) and os.path.exists(source_path):
+                if not ignore_cache and not render and os.path.isabs(source_path) and os.path.exists(source_path):
                     source_mtime = os.path.getmtime(source_path)
                     cached_mtime = file_mappings_cache.get(source_path, {}).get('mtime', 0)
 
@@ -1111,10 +1126,18 @@ class AiDeployAgent(AgentBase):
                         # Check if source exists
                         if not os.path.exists(source_path):
                             self.logger.error(f"    Source file not found: {source_path}")
+                        elif render:
+                            # Resolve secrets now so a dry run surfaces any
+                            # missing-secret errors before a real deploy.
+                            with open(source_path, 'rb') as f:
+                                _render(f.read(), source_path)
+                            self.logger.info(f"    [DRY RUN] Secret placeholders resolved OK")
                     else:
                         # Read from absolute path on local system
                         with open(source_path, 'rb') as f:
                             content = f.read()
+                        if render:
+                            content = _render(content, source_path)
 
                         # Write to destination with new name
                         self.dest_handler.write_file(dest_path, content)
@@ -1131,8 +1154,12 @@ class AiDeployAgent(AgentBase):
 
                     if dry_run:
                         self.logger.info(f"    [DRY RUN] Would copy and rename file")
+                        if render:
+                            self.logger.info(f"    [DRY RUN] Would resolve secret placeholders")
                     else:
                         content = self.source_handler.read_file(source_path)
+                        if render:
+                            content = _render(content, source_path)
                         self.dest_handler.write_file(dest_path, content)
                         self.logger.info(f"    ✓ Successfully copied and renamed")
                         files_copied += 1

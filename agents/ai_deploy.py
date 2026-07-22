@@ -765,9 +765,16 @@ class AiDeployAgent(AgentBase):
         # Normalize path for consistent comparison
         normalized_path = self._normalize_path(file_path)
 
-        # Check ignored files
+        # Check ignored files. Match against the full relative path AND the bare
+        # filename, so a pattern like ".env" ignores "shared/.env" too (not just a
+        # root-level ".env"). Without the basename check, ".env"/".DS_Store"/etc.
+        # in any subdirectory would silently sync — e.g. editing shared/.env would
+        # clobber the rendered prod shared/.env produced by a file mapping.
+        basename = os.path.basename(normalized_path)
         for pattern in ignore_config.get('files', []):
-            if fnmatch.fnmatch(file_path, pattern):
+            normalized_pattern = pattern.replace('\\', '/')
+            if (fnmatch.fnmatch(normalized_path, normalized_pattern)
+                    or fnmatch.fnmatch(basename, normalized_pattern)):
                 return True
 
         # Check ignored folders

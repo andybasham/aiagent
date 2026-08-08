@@ -2221,9 +2221,9 @@ class AiDeployAgent(AgentBase):
             # column it does not know about. The cost is the migration duration
             # added to the deploy (seconds), which is not worth a race.
             if self.config.get('database', {}).get('enabled', False):
-                self.logger.info("=" * 60)
-                self.logger.info("DEPLOYING DATABASE (before file sync)")
-                self.logger.info("=" * 60)
+                self.logger.warning("=" * 60)
+                self.logger.warning("DEPLOYING DATABASE (before file sync)")
+                self.logger.warning("=" * 60)
                 try:
                     self._deploy_database()
                 except Exception as e:

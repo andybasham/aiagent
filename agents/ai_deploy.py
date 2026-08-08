@@ -31,6 +31,10 @@ class AiDeployAgent(AgentBase):
         self.config_path = config_path
         self.cache_data = {}
         self.deployment_made_changes = False
+        # Source-relative paths touched by this run (see run()); None until the
+        # file comparison happens, which main.py reads as "don't know, run
+        # everything" rather than "nothing changed".
+        self.changed_paths = None
         self.source_pool = None  # Connection pool for source (if SSH)
         self.dest_pool = None  # Connection pool for destination (if SSH)
         self.verbose = self.config.get('options', {}).get('verbose', True)  # Default: True for backward compatibility
@@ -2202,6 +2206,15 @@ class AiDeployAgent(AgentBase):
             self.logger.warning(f"Modified files: {len(modified_files)}")
             self.logger.warning(f"Files to delete: {len(deleted_files)}")
             self.logger.warning("=" * 60)
+
+            # Publish what changed, relative to the source root, so main.py can
+            # decide whether a chained post_deploy has anything to carry. The
+            # bot configs only ship scripts/marketplace; a web-only release (or
+            # a no-op) has nothing for them, and five SSH round-trips is most of
+            # a small deploy's wall clock.
+            self.changed_paths = {
+                self._normalize_path(f['path']) for f in (new_files + modified_files)
+            } | {self._normalize_path(p) for p in deleted_files}
 
             # Perform synchronization
             if self.config.get('options', {}).get('dry_run', False):

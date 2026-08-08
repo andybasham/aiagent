@@ -10,7 +10,28 @@ from agents.ai_download import AiDownloadAgent
 from agents.ai_upload import AiUploadAgent
 
 
-def _run_post_deploy(post_deploy, base_config_path):
+def _post_deploy_subpath(entry_config, primary_source):
+    """
+    The source subdirectory a chained config ships, relative to the primary
+    deploy's source root — e.g. "scripts/marketplace" for the bot configs when
+    the primary deploys the whole repo.
+
+    Compared as raw strings so unresolved templates ({{APPLICATION_NAME}}) match
+    without needing the agent's substitution. Returns None when the two sources
+    don't share a prefix, which the caller treats as "can't tell, run it".
+    """
+    try:
+        entry_source = (entry_config.get('source') or {}).get('path')
+        if not entry_source or not primary_source:
+            return None
+        if not entry_source.startswith(primary_source):
+            return None
+        return entry_source[len(primary_source):].replace('\\', '/').strip('/')
+    except Exception:
+        return None
+
+
+def _run_post_deploy(post_deploy, base_config_path, changed_paths=None, primary_source=None):
     """
     Run additional deployments listed in the config's 'post_deploy' array.
 
@@ -42,12 +63,28 @@ def _run_post_deploy(post_deploy, base_config_path):
         if not entry_path.is_absolute():
             entry_path = config_dir / entry_path
 
-        print(f"\n>>> Running post-deploy: {entry_path}")
-
         if not entry_path.exists():
+            print(f"\n>>> Running post-deploy: {entry_path}")
             print(f"Error: post_deploy config not found: {entry_path}")
             all_succeeded = False
             continue
+
+        # Skip a chained deploy whose source subtree this run didn't touch.
+        # changed_paths is None when the primary agent can't report (non-deploy
+        # agents), and an empty set when it genuinely changed nothing — only the
+        # latter is safe to act on, so the None case still runs everything.
+        if changed_paths is not None:
+            try:
+                entry_config = json.loads(entry_path.read_text(encoding='utf-8'))
+            except Exception:
+                entry_config = {}
+            subpath = _post_deploy_subpath(entry_config, primary_source)
+            if subpath and not any(p.startswith(subpath + '/') or p == subpath
+                                   for p in changed_paths):
+                print(f"\n>>> Skipping post-deploy (no changes under {subpath}): {entry_path.name}")
+                continue
+
+        print(f"\n>>> Running post-deploy: {entry_path}")
 
         result = subprocess.run([sys.executable, __file__, str(entry_path)])
         if result.returncode != 0:
@@ -123,7 +160,9 @@ def main():
     # Run any chained deployments listed in 'post_deploy' (after primary success)
     post_deploy = raw_config.get('post_deploy', [])
     if post_deploy:
-        if not _run_post_deploy(post_deploy, config_path):
+        changed_paths = getattr(agent, 'changed_paths', None)
+        primary_source = (raw_config.get('source') or {}).get('path')
+        if not _run_post_deploy(post_deploy, config_path, changed_paths, primary_source):
             sys.exit(1)
 
 

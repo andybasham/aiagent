@@ -2207,38 +2207,42 @@ class AiDeployAgent(AgentBase):
             if self.config.get('options', {}).get('dry_run', False):
                 self.logger.warning("DRY RUN MODE - No changes will be made")
 
-            # Start database deployment in parallel with file sync (if configured)
-            database_future = None
+            # Migrations run BEFORE the file sync, not alongside it.
+            #
+            # They used to race: _deploy_database() went to a worker thread while
+            # files uploaded, so there was a window where new PHP was live and its
+            # ALTER TABLE had not run yet. Any code touching a brand-new column
+            # 500s for every request in that window — on a public endpoint that is
+            # lost traffic, and it forced each such release to carry a
+            # column-existence probe just to survive its own deploy.
+            #
+            # Schema-first is the only ordering that is safe in both directions:
+            # new code never meets an old schema, and old code tolerates a new
+            # column it does not know about. The cost is the migration duration
+            # added to the deploy (seconds), which is not worth a race.
             if self.config.get('database', {}).get('enabled', False):
-                with ThreadPoolExecutor(max_workers=1) as db_executor:
-                    self.logger.info("=" * 60)
-                    self.logger.info("STARTING DATABASE DEPLOYMENT IN BACKGROUND")
-                    self.logger.info("=" * 60)
-                    database_future = db_executor.submit(self._deploy_database)
+                self.logger.info("=" * 60)
+                self.logger.info("DEPLOYING DATABASE (before file sync)")
+                self.logger.info("=" * 60)
+                try:
+                    self._deploy_database()
+                except Exception as e:
+                    # Abort before any file lands: a half-migrated schema with the
+                    # old code still in place is recoverable, the reverse is not.
+                    self.logger.error(f"Database deployment failed — aborting before file sync: {e}")
+                    raise
 
-                    # Run file sync while database is deploying
-                    self._sync_files(new_files, modified_files, deleted_files)
+                self._sync_files(new_files, modified_files, deleted_files)
 
-                    # Update cache with deployed file metadata
-                    if new_files or modified_files or deleted_files:
-                        self.deployment_made_changes = True
-                        self._update_file_cache(source_files)
+                # Update cache with deployed file metadata
+                if new_files or modified_files or deleted_files:
+                    self.deployment_made_changes = True
+                    self._update_file_cache(source_files)
 
-                    self.logger.warning("Synchronization completed successfully!")
+                self.logger.warning("Synchronization completed successfully!")
 
-                    # Process file mappings (copy files with renamed destinations)
-                    self._process_file_mappings()
-
-                    # Wait for database deployment to complete
-                    if database_future:
-                        self.logger.info("=" * 60)
-                        self.logger.info("WAITING FOR DATABASE DEPLOYMENT TO COMPLETE...")
-                        self.logger.info("=" * 60)
-                        try:
-                            database_future.result()  # Wait for completion and raise any exceptions
-                        except Exception as e:
-                            self.logger.error(f"Database deployment failed: {e}")
-                            raise
+                # Process file mappings (copy files with renamed destinations)
+                self._process_file_mappings()
             else:
                 # No database deployment, just run file sync
                 self._sync_files(new_files, modified_files, deleted_files)

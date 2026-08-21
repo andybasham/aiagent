@@ -130,6 +130,24 @@ class AgentBase(ABC):
 
         # Create console handler with custom formatting
         handler = logging.StreamHandler()
+
+        # StreamHandler writes to sys.stderr, which on Windows encodes with the
+        # console codepage (cp1252 here). We log build and mysql output verbatim,
+        # and that output carries characters cp1252 cannot represent -- esbuild's
+        # size warning is the routine example. Encoding failures inside logging
+        # are swallowed into "--- Logging error ---", so the message that was
+        # being reported is exactly what gets lost, and it is usually being
+        # reported because something already went wrong.
+        #
+        # backslashreplace rather than replace: this path exists to carry error
+        # text, so an escaped character that can still be read is worth more than
+        # a tidier question mark. Guarded because the stream is not always a
+        # TextIOWrapper (it can be redirected or already wrapped).
+        try:
+            handler.stream.reconfigure(errors='backslashreplace')
+        except (AttributeError, ValueError, OSError):
+            pass
+
         formatter = CleanOutputFormatter(
             '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
         )

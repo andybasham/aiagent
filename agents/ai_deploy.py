@@ -681,12 +681,29 @@ class AiDeployAgent(AgentBase):
 
         try:
             # Pass current environment to ensure PATH is available (important for npm on Windows)
+            #
+            # encoding/errors are NOT optional here. text=True alone decodes with
+            # the locale codec -- cp1252 on Windows -- and esbuild writes its
+            # output to STDERR with emoji in it ("Done in 12ms", "1.0mb").
+            # The variation selector in that warning is EF B8 8F, and 0x8F is
+            # undefined in cp1252.
+            #
+            # capture_output reads the two streams on separate reader threads, so
+            # the decode error killed the stderr thread WITHOUT propagating: run()
+            # returned normally with returncode 0 and result.stderr set to None.
+            # The cost is silent and lands exactly when it hurts -- a build that
+            # actually fails reports its exit code and then skips the `if
+            # result.stderr` block, so the deploy prints "Pre-build failed" with
+            # no reason attached. errors='replace' means a stray byte costs one
+            # question mark instead of the whole error message.
             result = subprocess.run(
                 command,
                 shell=True,
                 cwd=working_dir,
                 capture_output=True,
                 text=True,
+                encoding='utf-8',
+                errors='replace',
                 env=os.environ.copy()
             )
 
